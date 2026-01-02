@@ -71,3 +71,19 @@ sum by (pod) (avg_over_time(events_received[10m])):double | step:datetime       
 26.5                                                      | 2024-05-10T00:10:00.000Z | two
 ;
 
+promql_eval_alias
+required_capability: promql_pre_tech_preview_v11
+required_capability: time_series_window_v1
+PROMQL index=k8s step=5m max by (pod) (avg_over_time(network.cost[5m]))
+| EVAL max_avg = ROUND(`max by (pod) (avg_over_time(network.cost[5m]))`, 6)
+| KEEP max_avg, step, pod
+| WHERE pod == "three"                                                                                                                                               
+| SORT pod, step
+;
+
+sum by (pod) (avg_over_time(events_received[10m])):double | step:datetime            | pod:keyword
+23.25                                                     | 2024-05-10T00:10:00.000Z | one
+9.0                                                       | 2024-05-10T00:10:00.000Z | three
+26.5                                                      | 2024-05-10T00:10:00.000Z | two
+;
+
