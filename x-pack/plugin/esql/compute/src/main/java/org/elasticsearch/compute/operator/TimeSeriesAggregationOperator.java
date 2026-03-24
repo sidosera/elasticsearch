@@ -7,6 +7,7 @@
 
 package org.elasticsearch.compute.operator;
 
+import org.apache.lucene.internal.hppc.IntArrayList;
 import org.apache.lucene.util.ArrayUtil;
 import org.elasticsearch.common.Rounding;
 import org.elasticsearch.common.util.BigArrays;
@@ -32,7 +33,6 @@ import org.elasticsearch.core.Releasables;
 import org.elasticsearch.index.mapper.DateFieldMapper;
 
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -210,7 +210,7 @@ public class TimeSeriesAggregationOperator extends HashAggregationOperator {
             long endTimestamp = tsBlockHash.timestampForGroup(groupId);
             long bucket = optimizedTimeBucket.nextRoundingValue(endTimestamp - timeResolution.convert(largestWindowMillis()));
             bucket = Math.max(bucket, tsBlockHash.minTimestamp());
-            // Fill the missing buckets between (timestamp-window, timestamp)
+            // Fill the missing buckets between (timestamp - window, timestamp)
             while (bucket < endTimestamp) {
                 if (tsBlockHash.addGroup(tsid, bucket) >= 0) {
                     expandingGroups.addGroup(Math.toIntExact(groupId));
@@ -349,10 +349,10 @@ public class TimeSeriesAggregationOperator extends HashAggregationOperator {
             }
 
             @Override
-            public List<Integer> groupIdsFromWindow(int startingGroupId, Duration window) {
+            public IntArrayList groupIdsFromWindow(int startingGroupId, Duration window) {
                 int tsid = tsBlockHash.tsidForGroup(startingGroupId);
                 long bucket = tsBlockHash.timestampForGroup(startingGroupId);
-                List<Integer> results = new ArrayList<>();
+                var results = new IntArrayList();
                 results.add(startingGroupId);
                 long endTimestamp = bucket + timeResolution.convert(window.toMillis());
                 while ((bucket = optimizedTimeBucket.nextRoundingValue(bucket)) < endTimestamp) {

@@ -7,6 +7,7 @@
 
 package org.elasticsearch.compute.aggregation;
 
+import org.apache.lucene.internal.hppc.IntArrayList;
 import org.apache.lucene.util.ArrayUtil;
 import org.elasticsearch.compute.data.Block;
 import org.elasticsearch.compute.data.IntArrayBlock;
@@ -16,6 +17,7 @@ import org.elasticsearch.compute.data.Page;
 import org.elasticsearch.core.Releasables;
 
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.IntStream;
 
@@ -71,15 +73,18 @@ public record WindowGroupingAggregatorFunction(GroupingAggregatorFunction next, 
         IntVector selected,
         TimeSeriesGroupingAggregatorEvaluationContext evaluationContext
     ) {
-        if (selected.getPositionCount() > 0) {
-            // TODO: rewrite to NO_WINDOW in the planner if the bucket and the window are the same
-            int groupId = selected.getInt(0);
-            long startTime = evaluationContext.rangeStartInMillis(groupId);
-            long endTime = evaluationContext.rangeEndInMillis(groupId);
-            if (endTime - startTime == window.toMillis()) {
-                next.evaluateFinal(blocks, offset, selected, evaluationContext);
-                return;
-            }
+        if (selected.getPositionCount() == 0) {
+            next.evaluateFinal(blocks, offset, selected, evaluationContext);
+            return;
+        }
+
+        // TODO: rewrite to NO_WINDOW in the planner if the bucket and the window are the same
+        int groupId = selected.getInt(0);
+        long startTime = evaluationContext.rangeStartInMillis(groupId);
+        long endTime = evaluationContext.rangeEndInMillis(groupId);
+        if (endTime - startTime == window.toMillis()) {
+            next.evaluateFinal(blocks, offset, selected, evaluationContext);
+            return;
         }
         int blockCount = next.intermediateBlockCount();
         List<Integer> channels = IntStream.range(0, blockCount).boxed().toList();
@@ -88,17 +93,24 @@ public record WindowGroupingAggregatorFunction(GroupingAggregatorFunction next, 
             Block[] intermediateBlocks = new Block[blockCount];
             int[] backwards = new int[selected.getPositionCount()];
             for (int i = 0; i < selected.getPositionCount(); i++) {
-                int groupId = selected.getInt(i);
+                groupId = selected.getInt(i);
                 backwards = ArrayUtil.grow(backwards, groupId + 1);
                 backwards[groupId] = i;
             }
             try {
                 next.evaluateIntermediate(intermediateBlocks, 0, selected);
                 Page page = new Page(intermediateBlocks);
-                finalAgg.aggregatorFunction().addIntermediateInput(0, selected, page);
+                GroupingAggregatorFunction finalAggFunction = finalAgg.aggregatorFunction();
+                int[] positionsWithState = positionsWithIntermediateState(page);
+                boolean hasNullIntermediateState = positionsWithState.length != page.getPositionCount();
+                if (hasNullIntermediateState) {
+                    addNonNullIntermediateInput(finalAggFunction, selected, page, positionsWithState);
+                } else {
+                    finalAggFunction.addIntermediateInput(0, selected, page);
+                }
                 for (int i = 0; i < selected.getPositionCount(); i++) {
-                    int groupId = selected.getInt(i);
-                    mergeBucketsFromWindow(groupId, backwards, page, finalAgg.aggregatorFunction(), evaluationContext);
+                    groupId = selected.getInt(i);
+                    mergeBucketsFromWindow(groupId, backwards, page, finalAggFunction, evaluationContext, hasNullIntermediateState);
                 }
             } finally {
                 Releasables.close(intermediateBlocks);
@@ -120,7 +132,7 @@ public record WindowGroupingAggregatorFunction(GroupingAggregatorFunction next, 
                     }
 
                     @Override
-                    public List<Integer> groupIdsFromWindow(int startingGroupId, Duration window) {
+                    public IntArrayList groupIdsFromWindow(int startingGroupId, Duration window) {
                         throw new UnsupportedOperationException();
                     }
 
@@ -148,17 +160,76 @@ public record WindowGroupingAggregatorFunction(GroupingAggregatorFunction next, 
         int[] groupIdToPositions,
         Page page,
         GroupingAggregatorFunction fn,
-        TimeSeriesGroupingAggregatorEvaluationContext context
+        TimeSeriesGroupingAggregatorEvaluationContext context,
+        boolean hasNullIntermediateState
     ) {
         var groupIds = context.groupIdsFromWindow(startingGroupId, window);
         if (groupIds.size() > 1) {
             try (IntVector oneGroup = context.driverContext().blockFactory().newConstantIntVector(startingGroupId, 1)) {
-                for (int g : groupIds) {
+                for (int i = 0, n = groupIds.size(); i < n; i++) {
+                    int g = groupIds.buffer[i];
                     if (g != startingGroupId) {
                         int position = groupIdToPositions[g];
-                        fn.addIntermediateInput(position, oneGroup, page);
+                        if (hasNullIntermediateState == false) {
+                            fn.addIntermediateInput(position, oneGroup, page);
+                            continue;
+                        }
+                        if (hasIntermediateState(page, position) == false) {
+                            continue;
+                        }
+                        try (Page singlePositionPage = filterPage(page, position)) {
+                            fn.addIntermediateInput(0, oneGroup, singlePositionPage);
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    private static void addNonNullIntermediateInput(GroupingAggregatorFunction fn, IntVector groups, Page page, int[] positionsWithState) {
+        if (positionsWithState.length == 0) {
+            return;
+        }
+        try (
+            IntVector filteredGroups = groups.filter(false, positionsWithState);
+            Page filteredPage = filterPage(page, positionsWithState)
+        ) {
+            fn.addIntermediateInput(0, filteredGroups, filteredPage);
+        }
+    }
+
+    private static int[] positionsWithIntermediateState(Page page) {
+        int[] positions = new int[page.getPositionCount()];
+        int count = 0;
+        for (int position = 0; position < page.getPositionCount(); position++) {
+            if (hasIntermediateState(page, position)) {
+                positions[count++] = position;
+            }
+        }
+        return Arrays.copyOf(positions, count);
+    }
+
+    private static boolean hasIntermediateState(Page page, int position) {
+        for (int i = 0; i < page.getBlockCount(); i++) {
+            if (page.getBlock(i).isNull(position)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static Page filterPage(Page page, int... positions) {
+        Block[] filteredBlocks = new Block[page.getBlockCount()];
+        boolean success = false;
+        try {
+            for (int i = 0; i < filteredBlocks.length; i++) {
+                filteredBlocks[i] = page.getBlock(i).filter(false, positions);
+            }
+            success = true;
+            return new Page(positions.length, filteredBlocks);
+        } finally {
+            if (success == false) {
+                Releasables.closeExpectNoException(filteredBlocks);
             }
         }
     }

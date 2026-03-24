@@ -7,10 +7,10 @@
 
 package org.elasticsearch.compute.aggregation;
 
+import org.apache.lucene.internal.hppc.IntArrayList;
 import org.elasticsearch.compute.operator.DriverContext;
 
 import java.time.Duration;
-import java.util.List;
 
 public abstract class TimeSeriesGroupingAggregatorEvaluationContext extends GroupingAggregatorEvaluationContext {
     public TimeSeriesGroupingAggregatorEvaluationContext(DriverContext driverContext) {
@@ -39,9 +39,9 @@ public abstract class TimeSeriesGroupingAggregatorEvaluationContext extends Grou
      *
      * @param startingGroupId the starting group ID
      * @param window          the window duration
-     * @return a list of group IDs within the window
+     * @return array of group IDs within the window
      */
-    public abstract List<Integer> groupIdsFromWindow(int startingGroupId, Duration window);
+    public abstract IntArrayList groupIdsFromWindow(int startingGroupId, Duration window);
 
     public abstract int previousGroupId(int currentGroupId);
 
