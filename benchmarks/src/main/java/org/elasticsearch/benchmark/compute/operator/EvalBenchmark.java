@@ -96,6 +96,15 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * Microbenchmark for ESQL expression evaluators.
+ * <p>
+ * All benchmarks:
+ * ./gradlew -p benchmarks run --args 'EvalBenchmark'
+ * <p>
+ * Single benchmark:
+ * ./gradlew -p benchmarks run --args 'EvalBenchmark -p operation=abs -wi 1 -i 2 -f 1'
+ */
 @Warmup(iterations = 5)
 @Measurement(iterations = 7)
 @BenchmarkMode(Mode.AverageTime)
