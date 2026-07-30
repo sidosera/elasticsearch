@@ -7,7 +7,6 @@
 
 package org.elasticsearch.compute.aggregation;
 
-import org.apache.lucene.util.PriorityQueue;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.common.util.PageCacheRecycler;
@@ -26,68 +25,23 @@ import java.util.Arrays;
 import static org.elasticsearch.compute.aggregation.AbstractRateGroupingFunction.BufferedArray.indexInPage;
 import static org.elasticsearch.compute.aggregation.AbstractRateGroupingFunction.BufferedArray.pageIndex;
 
-class AbstractRateGroupingFunction {
-    /**
-     * Buffers data points in two arrays: one for timestamps and one for values, partitioned into multiple slices.
-     * Each slice is sorted in descending order of timestamp. A new slice is created when a data point has a
-     * timestamp greater than the last point of the current slice or it belongs to a different group (=timeseries).
-     * Since each page is sorted by descending timestamp,
-     * we only need to compare the first point of the new page with the last point of the current slice to decide
-     * if a new slice is needed. During merging, a priority queue is used to iterate through the slices, selecting
-     * the slice with the greatest timestamp.
-     */
+/**
+ * Shared buffering and flush-merge infrastructure for rate/increase grouping aggregators.
+ * <p>
+ * Buffers data points in parallel timestamp and value arrays, partitioned into slices. Each slice is sorted
+ * in descending timestamp order. A new slice is created when a data point has a timestamp greater than the
+ * last point of the current slice or belongs to a different group. During flushing, an in-place max-heap over
+ * slice offsets merges slices by greatest timestamp.
+ */
+public class AbstractRateGroupingFunction {
     static final int INITIAL_SLICE_CAPACITY = 512;
 
-    // Reusable FlushQueue and Slice pool to avoid per-group-per-flush allocations.
-    private FlushQueue reusableFlushQueue;
-    private Slice[] slicePool;
-
     /**
-     * Populates and returns the reusable {@link FlushQueue} for the given group, reusing pooled {@link Slice}
-     * objects to avoid per-group-per-flush allocations. Returns null if the group has no data.
+     * Returns the flush queue for {@code groupId}, or null if the group has no samples.
+     * Kept as a named entry point for the rate aggregators that previously used a pooled object queue.
      */
     protected final FlushQueue populateReusableFlushQueue(FlushQueues flushQueues, int groupId) {
-        if (groupId < flushQueues.minGroupId() || groupId > flushQueues.maxGroupId()) {
-            return null;
-        }
-        int groupIndex = groupId - flushQueues.minGroupId();
-        int[] runningOffsets = flushQueues.runningOffsets();
-        int endIndex = runningOffsets[groupIndex];
-        int startIndex = groupIndex == 0 ? 0 : runningOffsets[groupIndex - 1];
-        int numSlices = endIndex - startIndex;
-        if (numSlices == 0) {
-            return null;
-        }
-        if (slicePool == null || numSlices > slicePool.length) {
-            int newCapacity = slicePool == null ? numSlices : Math.max(numSlices, slicePool.length * 2);
-            slicePool = slicePool == null ? new Slice[newCapacity] : Arrays.copyOf(slicePool, newCapacity);
-            reusableFlushQueue = new FlushQueue(newCapacity);
-        } else {
-            reusableFlushQueue.clear();
-            reusableFlushQueue.valueCount = 0;
-        }
-        int[] sliceOffsets = flushQueues.sliceOffsets();
-        RawBuffer buffer = flushQueues.buffer();
-        int slotIndex = 0;
-        for (int i = startIndex; i < endIndex; i++) {
-            int start = sliceOffsets[i * 2];
-            int end = sliceOffsets[i * 2 + 1];
-            if (start < end) {
-                Slice slice = slicePool[slotIndex];
-                if (slice == null) {
-                    slicePool[slotIndex] = slice = new Slice(buffer.timestamps, start, end);
-                } else {
-                    slice.reset(start, end);
-                }
-                slotIndex++;
-                reusableFlushQueue.valueCount += (end - start);
-                reusableFlushQueue.add(slice);
-            }
-        }
-        if (reusableFlushQueue.valueCount == 0) {
-            return null;
-        }
-        return reusableFlushQueue;
+        return flushQueues.getFlushQueue(groupId);
     }
 
     abstract static class RawBuffer implements Releasable {
@@ -187,93 +141,233 @@ class AbstractRateGroupingFunction {
             int groupIndex = groupId - minGroupId;
             int endIndex = runningOffsets[groupIndex];
             int startIndex = groupIndex == 0 ? 0 : runningOffsets[groupIndex - 1];
-            int numSlices = endIndex - startIndex;
-            if (numSlices == 0) {
+            if (startIndex >= endIndex) {
                 return null;
             }
-            FlushQueue queue = new FlushQueue(numSlices);
+            // Compact empty pairs into the front of this group's range, then heapify in place.
+            // Ownership: the queue may reorder and mutate sliceOffsets[startIndex*2 .. endIndex*2)
+            // during flush; original pair order/starts are not needed afterward.
+            int write = startIndex;
+            int valueCount = 0;
             for (int i = startIndex; i < endIndex; i++) {
                 int start = sliceOffsets[i * 2];
                 int end = sliceOffsets[i * 2 + 1];
                 if (start < end) {
-                    queue.valueCount += (end - start);
-                    queue.add(new Slice(buffer.timestamps, start, end));
+                    if (write != i) {
+                        sliceOffsets[write * 2] = start;
+                        sliceOffsets[write * 2 + 1] = end;
+                    }
+                    valueCount += end - start;
+                    write++;
                 }
             }
-            if (queue.valueCount == 0) {
+            int size = write - startIndex;
+            if (valueCount == 0) {
                 return null;
             }
-            return queue;
+            return new FlushQueue(buffer.timestamps, sliceOffsets, startIndex * 2, size, valueCount);
         }
     }
 
-    static final class Slice {
-        int start;
-        int end;
-        long nextTimestamp;
-        private long lastTimestamp = Long.MAX_VALUE;
-        final LongBuffer timestamps;
+    /**
+     * In-place max-heap over a group's slice-offset pairs in {@code slices}.
+     * <p>
+     * Takes ownership of {@code slices[base .. base + 2*size)} for the duration of flushing and may
+     * reorder pairs, advance starts, and shrink {@link #size}. Node {@code i} occupies
+     * {@code (start, end) = (slices[base + 2*i], slices[base + 2*i + 1])}. The heap key is
+     * {@code timestamps.get(start)}; equal timestamps break ties by smaller {@code start}.
+     */
+    public static final class FlushQueue {
+        private final LongBuffer timestamps;
+        private final int[] slices;
+        private final int base;
+        private int size;
+        public final int valueCount;
 
-        Slice(LongBuffer timestamps, int start, int end) {
+        public FlushQueue(LongBuffer timestamps, int[] slices, int base, int size, int valueCount) {
             this.timestamps = timestamps;
-            this.start = start;
-            this.end = end;
-            this.nextTimestamp = timestamps.get(start);
-        }
-
-        void reset(int start, int end) {
-            this.start = start;
-            this.end = end;
-            this.nextTimestamp = timestamps.get(start);
-            this.lastTimestamp = Long.MAX_VALUE;
-        }
-
-        boolean exhausted() {
-            return start >= end;
-        }
-
-        int next() {
-            int currentIndex = start;
-            start++;
-            if (start < end) {
-                nextTimestamp = timestamps.get(start); // next timestamp
-            }
-            return currentIndex;
-        }
-
-        long lastTimestamp() {
-            if (lastTimestamp == Long.MAX_VALUE) {
-                lastTimestamp = timestamps.get(end - 1);
-            }
-            return lastTimestamp;
-        }
-    }
-
-    static final class FlushQueue extends PriorityQueue<Slice> {
-        int valueCount;
-
-        FlushQueue(int maxSize) {
-            super(maxSize);
+            this.slices = slices;
+            this.base = base;
+            this.size = size;
+            this.valueCount = valueCount;
+            heapify();
         }
 
         /**
-         * Returns the timestamp of the slice that would be next in line after the best slice.
+         * Builds a queue over {@code sliceOffsets} (pairs of start/end), compacting empty ranges.
+         * Mutates {@code sliceOffsets} in place. Visible for benchmarks and tests.
          */
-        long secondNextTimestamp() {
-            final Object[] heap = getHeapArray();
-            final int size = size();
+        public static FlushQueue fromSliceOffsets(LongBuffer timestamps, int[] sliceOffsets) {
+            int endIndex = sliceOffsets.length / 2;
+            int write = 0;
+            int valueCount = 0;
+            for (int i = 0; i < endIndex; i++) {
+                int start = sliceOffsets[i * 2];
+                int end = sliceOffsets[i * 2 + 1];
+                if (start < end) {
+                    if (write != i) {
+                        sliceOffsets[write * 2] = start;
+                        sliceOffsets[write * 2 + 1] = end;
+                    }
+                    valueCount += end - start;
+                    write++;
+                }
+            }
+            if (valueCount == 0) {
+                return null;
+            }
+            return new FlushQueue(timestamps, sliceOffsets, 0, write, valueCount);
+        }
+
+        public int size() {
+            return size;
+        }
+
+        public int topStart() {
+            return start(0);
+        }
+
+        public int topEnd() {
+            return end(0);
+        }
+
+        public long topNextTimestamp() {
+            return nextTimestamp(0);
+        }
+
+        public long topLastTimestamp() {
+            return timestamps.get(end(0) - 1);
+        }
+
+        public boolean topExhausted() {
+            return start(0) >= end(0);
+        }
+
+        /**
+         * Returns the current root sample index and advances the root slice's start.
+         * Does not restore heap order; callers must {@link #updateTop()} or {@link #popTop()}.
+         */
+        public int consumeTop() {
+            int position = start(0);
+            setStart(0, position + 1);
+            return position;
+        }
+
+        public void updateTop() {
+            assert start(0) < end(0) : "updateTop on exhausted root";
+            siftDown(0);
+        }
+
+        public void popTop() {
+            size--;
+            if (size == 0) {
+                return;
+            }
+            copyNode(size, 0);
+            siftDown(0);
+        }
+
+        /**
+         * Greatest next-timestamp among the root's children, or {@link Long#MIN_VALUE} if none.
+         */
+        public long secondNextTimestamp() {
             if (size == 2) {
-                return ((Slice) heap[2]).nextTimestamp;
+                return nextTimestamp(1);
             } else if (size >= 3) {
-                return Math.max(((Slice) heap[2]).nextTimestamp, ((Slice) heap[3]).nextTimestamp);
+                return Math.max(nextTimestamp(1), nextTimestamp(2));
             } else {
                 return Long.MIN_VALUE;
             }
         }
 
-        @Override
-        protected boolean lessThan(Slice a, Slice b) {
-            return a.nextTimestamp > b.nextTimestamp; // want the latest timestamp first
+        private void heapify() {
+            if (size <= 1) {
+                return;
+            }
+            for (int i = (size - 2) >>> 1; i >= 0; i--) {
+                siftDown(i);
+            }
+        }
+
+        private void siftDown(int node) {
+            while (true) {
+                int left = (node << 1) + 1;
+                if (left >= size) {
+                    return;
+                }
+                int best = left;
+                int right = left + 1;
+                if (right < size && precedes(right, left)) {
+                    best = right;
+                }
+                if (precedes(node, best)) {
+                    return;
+                }
+                swap(node, best);
+                node = best;
+            }
+        }
+
+        /**
+         * {@code true} if {@code left} should be nearer the root than {@code right}
+         * (greater timestamp, or equal timestamp with smaller start).
+         */
+        private boolean precedes(int left, int right) {
+            long leftTs = nextTimestamp(left);
+            long rightTs = nextTimestamp(right);
+            if (leftTs != rightTs) {
+                return leftTs > rightTs;
+            }
+            return start(left) < start(right);
+        }
+
+        private int start(int node) {
+            return slices[base + (node << 1)];
+        }
+
+        private int end(int node) {
+            return slices[base + (node << 1) + 1];
+        }
+
+        private void setStart(int node, int start) {
+            slices[base + (node << 1)] = start;
+        }
+
+        private long nextTimestamp(int node) {
+            return timestamps.get(start(node));
+        }
+
+        private void swap(int left, int right) {
+            int leftOffset = base + (left << 1);
+            int rightOffset = base + (right << 1);
+            int start = slices[leftOffset];
+            int end = slices[leftOffset + 1];
+            slices[leftOffset] = slices[rightOffset];
+            slices[leftOffset + 1] = slices[rightOffset + 1];
+            slices[rightOffset] = start;
+            slices[rightOffset + 1] = end;
+        }
+
+        private void copyNode(int from, int to) {
+            int fromOffset = base + (from << 1);
+            int toOffset = base + (to << 1);
+            slices[toOffset] = slices[fromOffset];
+            slices[toOffset + 1] = slices[fromOffset + 1];
+        }
+
+        /** Package-private for tests: parent precedes (or ties) each child. */
+        boolean checkHeapInvariant() {
+            for (int parent = 0; parent < size; parent++) {
+                int left = (parent << 1) + 1;
+                if (left < size && precedes(left, parent)) {
+                    return false;
+                }
+                int right = left + 1;
+                if (right < size && precedes(right, parent)) {
+                    return false;
+                }
+            }
+            return true;
         }
     }
 
@@ -310,11 +404,11 @@ class AbstractRateGroupingFunction {
             capacity = (long) newNumPages << PAGE_SHIFT;
         }
 
-        final int size() {
+        public final int size() {
             return size;
         }
 
-        final void clear() {
+        public final void clear() {
             size = 0;
         }
 
@@ -339,10 +433,10 @@ class AbstractRateGroupingFunction {
      * Append-only paged long array backed by {@code long[][]}.
      * Avoids the VarHandle byte[]-backed LongArray and leverages {@link System#arraycopy} when possible.
      */
-    static final class LongBuffer extends BufferedArray {
+    public static final class LongBuffer extends BufferedArray {
         long[][] pages;
 
-        LongBuffer(CircuitBreaker breaker, long initialCapacity) {
+        public LongBuffer(CircuitBreaker breaker, long initialCapacity) {
             super(breaker, initialCapacity, Long.BYTES);
             pages = new long[numPages][];
             for (int i = 0; i < numPages; i++) {
@@ -350,12 +444,12 @@ class AbstractRateGroupingFunction {
             }
         }
 
-        long get(long index) {
+        public long get(long index) {
             assert index < size : "Index [" + index + "] out of bounds, size: " + size;
             return pages[pageIndex(index)][indexInPage(index)];
         }
 
-        void append(long value) {
+        public void append(long value) {
             pages[pageIndex(size)][indexInPage(size)] = value;
             size++;
         }
@@ -373,7 +467,7 @@ class AbstractRateGroupingFunction {
             size += count;
         }
 
-        void ensureCapacity(long minCapacity) {
+        public void ensureCapacity(long minCapacity) {
             int oldNumPages = numPages;
             grow(minCapacity, Long.BYTES);
             if (numPages > oldNumPages) {

@@ -595,26 +595,20 @@ public final class RateLongGroupingAggregatorFunction extends AbstractRateGroupi
         var timestamps = buffer.timestamps;
         var values = buffer.values;
         if (flushQueue.valueCount == 1) {
-            long t = timestamps.get(flushQueue.top().start);
-            long v = values.get(flushQueue.top().start);
+            int p = flushQueue.topStart();
+            long t = timestamps.get(p);
+            long v = values.get(p);
             appendInterval(groupId, t, v, t, v, 1, 0.0);
             return;
         }
         // first
-        final long lastTimestamp;
-        final long lastValue;
-        Slice top;
-        {
-            top = flushQueue.top();
-            int position = top.next();
-            lastTimestamp = timestamps.get(position);
-            lastValue = values.get(position);
-            if (top.exhausted()) {
-                flushQueue.pop();
-                top = flushQueue.top();
-            } else {
-                top = flushQueue.updateTop();
-            }
+        int position = flushQueue.consumeTop();
+        final long lastTimestamp = timestamps.get(position);
+        final long lastValue = values.get(position);
+        if (flushQueue.topExhausted()) {
+            flushQueue.popTop();
+        } else {
+            flushQueue.updateTop();
         }
         long prevValue = lastValue;
         double resetsAccum = 0.0;
@@ -623,43 +617,48 @@ public final class RateLongGroupingAggregatorFunction extends AbstractRateGroupi
             // If the last timestamp is greater than the maximum timestamp of the next two candidate slices,
             // there is no overlap with subsequent slices, so batch merging can be performed without comparing
             // timestamps from the buffer.
-            if (top.lastTimestamp() > secondNextTimestamp) {
-                for (int p = top.start; p < top.end; p++) {
+            if (flushQueue.topLastTimestamp() > secondNextTimestamp) {
+                for (int p = flushQueue.topStart(); p < flushQueue.topEnd(); p++) {
                     long val = values.get(p);
                     if (val > prevValue) {
                         resetsAccum += val;
                     }
                     prevValue = val;
                 }
-                flushQueue.pop();
-                top = flushQueue.top();
+                flushQueue.popTop();
                 secondNextTimestamp = flushQueue.secondNextTimestamp();
                 continue;
             }
-            long val = values.get(top.next());
+            long val = values.get(flushQueue.consumeTop());
             if (val > prevValue) {
                 resetsAccum += val;
             }
             prevValue = val;
-            if (top.exhausted()) {
-                flushQueue.pop();
-                top = flushQueue.top();
+            if (flushQueue.topExhausted()) {
+                flushQueue.popTop();
                 secondNextTimestamp = flushQueue.secondNextTimestamp();
-            } else if (top.nextTimestamp < secondNextTimestamp) {
-                top = flushQueue.updateTop();
+            } else if (flushQueue.topNextTimestamp() < secondNextTimestamp) {
+                flushQueue.updateTop();
                 secondNextTimestamp = flushQueue.secondNextTimestamp();
             }
         }
         // last slice
-        top = flushQueue.top();
-        for (int p = top.start; p < top.end; p++) {
+        for (int p = flushQueue.topStart(); p < flushQueue.topEnd(); p++) {
             long val = values.get(p);
             if (val > prevValue) {
                 resetsAccum += val;
             }
             prevValue = val;
         }
-        appendInterval(groupId, lastTimestamp, lastValue, timestamps.get(top.end - 1), prevValue, flushQueue.valueCount, resetsAccum);
+        appendInterval(
+            groupId,
+            lastTimestamp,
+            lastValue,
+            timestamps.get(flushQueue.topEnd() - 1),
+            prevValue,
+            flushQueue.valueCount,
+            resetsAccum
+        );
     }
 
     @Override

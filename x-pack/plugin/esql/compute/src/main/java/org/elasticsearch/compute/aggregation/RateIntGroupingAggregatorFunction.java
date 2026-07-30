@@ -593,68 +593,67 @@ public final class RateIntGroupingAggregatorFunction extends AbstractRateGroupin
         var timestamps = buffer.timestamps;
         var values = buffer.values;
         if (flushQueue.valueCount == 1) {
-            long t = timestamps.get(flushQueue.top().start);
-            int v = values.get(flushQueue.top().start);
+            int p = flushQueue.topStart();
+            long t = timestamps.get(p);
+            int v = values.get(p);
             appendInterval(groupId, t, v, t, v, 1, 0.0);
             return;
         }
         // first
-        final long lastTimestamp;
-        final int lastValue;
-        Slice top;
-        {
-            top = flushQueue.top();
-            int position = top.next();
-            lastTimestamp = timestamps.get(position);
-            lastValue = values.get(position);
-            if (top.exhausted()) {
-                flushQueue.pop();
-                top = flushQueue.top();
-            } else {
-                top = flushQueue.updateTop();
-            }
+        int position = flushQueue.consumeTop();
+        final long lastTimestamp = timestamps.get(position);
+        final int lastValue = values.get(position);
+        if (flushQueue.topExhausted()) {
+            flushQueue.popTop();
+        } else {
+            flushQueue.updateTop();
         }
         int prevValue = lastValue;
         double resetsAccum = 0.0;
         long secondNextTimestamp = flushQueue.secondNextTimestamp();
         while (flushQueue.size() > 1) {
-            if (top.lastTimestamp() > secondNextTimestamp) {
-                for (int p = top.start; p < top.end; p++) {
+            if (flushQueue.topLastTimestamp() > secondNextTimestamp) {
+                for (int p = flushQueue.topStart(); p < flushQueue.topEnd(); p++) {
                     int val = values.get(p);
                     if (val > prevValue) {
                         resetsAccum += val;
                     }
                     prevValue = val;
                 }
-                flushQueue.pop();
-                top = flushQueue.top();
+                flushQueue.popTop();
                 secondNextTimestamp = flushQueue.secondNextTimestamp();
                 continue;
             }
-            int val = values.get(top.next());
+            int val = values.get(flushQueue.consumeTop());
             if (val > prevValue) {
                 resetsAccum += val;
             }
             prevValue = val;
-            if (top.exhausted()) {
-                flushQueue.pop();
-                top = flushQueue.top();
+            if (flushQueue.topExhausted()) {
+                flushQueue.popTop();
                 secondNextTimestamp = flushQueue.secondNextTimestamp();
-            } else if (top.nextTimestamp < secondNextTimestamp) {
-                top = flushQueue.updateTop();
+            } else if (flushQueue.topNextTimestamp() < secondNextTimestamp) {
+                flushQueue.updateTop();
                 secondNextTimestamp = flushQueue.secondNextTimestamp();
             }
         }
         // last slice
-        top = flushQueue.top();
-        for (int p = top.start; p < top.end; p++) {
+        for (int p = flushQueue.topStart(); p < flushQueue.topEnd(); p++) {
             int val = values.get(p);
             if (val > prevValue) {
                 resetsAccum += val;
             }
             prevValue = val;
         }
-        appendInterval(groupId, lastTimestamp, lastValue, timestamps.get(top.end - 1), prevValue, flushQueue.valueCount, resetsAccum);
+        appendInterval(
+            groupId,
+            lastTimestamp,
+            lastValue,
+            timestamps.get(flushQueue.topEnd() - 1),
+            prevValue,
+            flushQueue.valueCount,
+            resetsAccum
+        );
     }
 
     @Override
