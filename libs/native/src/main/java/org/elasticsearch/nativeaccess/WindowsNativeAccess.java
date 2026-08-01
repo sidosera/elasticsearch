@@ -226,6 +226,11 @@ public class WindowsNativeAccess extends AbstractNativeAccess {
     }
 
     @Override
+    public Optional<EsqlKernelLibrary> getEsqlKernelLibrary() {
+        return Optional.empty(); // not supported yet
+    }
+
+    @Override
     public Optional<ParquetRsFunctions> getParquetRsFunctions() {
         return Optional.empty(); // not supported yet
     }

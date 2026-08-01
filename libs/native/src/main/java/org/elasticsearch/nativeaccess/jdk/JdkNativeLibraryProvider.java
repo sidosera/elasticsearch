@@ -9,6 +9,7 @@
 
 package org.elasticsearch.nativeaccess.jdk;
 
+import org.elasticsearch.nativeaccess.EsqlKernelLibrary;
 import org.elasticsearch.nativeaccess.lib.JavaLibrary;
 import org.elasticsearch.nativeaccess.lib.Kernel32Library;
 import org.elasticsearch.nativeaccess.lib.NativeLibraryProvider;
@@ -32,6 +33,8 @@ public class JdkNativeLibraryProvider extends NativeLibraryProvider {
                 JdkKernel32Library::new,
                 VectorLibrary.class,
                 JdkVectorLibrary::new,
+                EsqlKernelLibrary.class,
+                JdkEsqlKernelLibrary::new,
                 ParquetRsLibrary.class,
                 JdkParquetRsLibrary::new
             )

@@ -74,6 +74,16 @@ $if(BytesRef)$
 $else$
     $type$ get$Type$(int position);
 
+$if(double)$
+    /**
+     * Returns the zero-based backing array if this vector is backed by one, otherwise {@code null}.
+     * Callers must not mutate the returned array unless they own the vector they are building from it.
+     */
+    default double[] asArray() {
+        return null;
+    }
+
+$endif$
     /**
      * Copies values from this vector into the destination array.
      */

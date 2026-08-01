@@ -32,6 +32,7 @@ public abstract class PosixNativeAccess extends AbstractNativeAccess {
 
     protected final PosixCLibrary libc;
     protected final VectorSimilarityFunctions vectorDistance;
+    protected final EsqlKernelLibrary esqlKernelLibrary;
     protected final ParquetRsFunctions parquetRsFunctions;
     protected final PosixConstants constants;
     protected final ProcessLimits processLimits;
@@ -40,6 +41,7 @@ public abstract class PosixNativeAccess extends AbstractNativeAccess {
         super(name, libraryProvider);
         this.libc = libraryProvider.getLibrary(PosixCLibrary.class);
         this.vectorDistance = vectorSimilarityFunctionsOrNull(libraryProvider);
+        this.esqlKernelLibrary = esqlKernelLibraryOrNull(libraryProvider);
         this.parquetRsFunctions = parquetRsFunctionsOrNull(libraryProvider);
         this.constants = constants;
         this.processLimits = new ProcessLimits(
@@ -75,6 +77,23 @@ public abstract class PosixNativeAccess extends AbstractNativeAccess {
             var lib = libraryProvider.getLibrary(VectorLibrary.class).getVectorSimilarityFunctions();
             logger.info("Using native vector library; to disable start with -D" + ENABLE_JDK_VECTOR_LIBRARY + "=false");
             return lib;
+        }
+        return null;
+    }
+
+    static EsqlKernelLibrary esqlKernelLibraryOrNull(NativeLibraryProvider libraryProvider) {
+        if (isEsqlKernelLibrarySupported()) {
+            try {
+                var esqlKernelLibrary = libraryProvider.getLibrary(EsqlKernelLibrary.class);
+                if (esqlKernelLibrary.hasSqrtDoubles()) {
+                    logger.info("Loaded ES|QL expression kernels");
+                    return esqlKernelLibrary;
+                }
+                return null;
+            } catch (UnsatisfiedLinkError e) {
+                logger.info("ES|QL expression kernels not available: {}", e.getMessage());
+                return null;
+            }
         }
         return null;
     }
@@ -212,6 +231,11 @@ public abstract class PosixNativeAccess extends AbstractNativeAccess {
     }
 
     @Override
+    public Optional<EsqlKernelLibrary> getEsqlKernelLibrary() {
+        return Optional.ofNullable(esqlKernelLibrary);
+    }
+
+    @Override
     public Optional<ParquetRsFunctions> getParquetRsFunctions() {
         return Optional.ofNullable(parquetRsFunctions);
     }
@@ -234,6 +258,10 @@ public abstract class PosixNativeAccess extends AbstractNativeAccess {
     }
 
     static boolean isNativeRustLibSupported() {
+        return isMacOrLinuxAarch64() || isLinuxAmd64();
+    }
+
+    static boolean isEsqlKernelLibrarySupported() {
         return isMacOrLinuxAarch64() || isLinuxAmd64();
     }
 

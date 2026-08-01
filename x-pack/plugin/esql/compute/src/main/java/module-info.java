@@ -14,6 +14,7 @@ module org.elasticsearch.compute {
     requires org.elasticsearch.base;
     requires org.elasticsearch.server;
     requires org.elasticsearch.compute.ann;
+    requires org.elasticsearch.nativeaccess;
     requires org.elasticsearch.xcontent;
     // required due to dependency on org.elasticsearch.common.util.concurrent.AbstractAsyncTask
     requires org.apache.logging.log4j;

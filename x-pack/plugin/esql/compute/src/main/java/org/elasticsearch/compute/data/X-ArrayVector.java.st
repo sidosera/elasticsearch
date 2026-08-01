@@ -143,6 +143,13 @@ $else$
         return values[position];
     }
 
+$if(double)$
+    @Override
+    public double[] asArray() {
+        return values;
+    }
+
+$endif$
     @Override
     public void copyTo(int srcPosition, $type$[] dst, int dstPosition, int length) {
         System.arraycopy(values, srcPosition, dst, dstPosition, length);

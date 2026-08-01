@@ -180,6 +180,11 @@ public interface NativeAccess {
     Optional<VectorSimilarityFunctions> getVectorSimilarityFunctions();
 
     /**
+     * Returns ES|QL expression kernels, or an empty optional if unavailable on this platform.
+     */
+    Optional<EsqlKernelLibrary> getEsqlKernelLibrary();
+
+    /**
      * Returns Parquet-rs native functions, or an empty optional if unavailable on this platform.
      */
     Optional<ParquetRsFunctions> getParquetRsFunctions();

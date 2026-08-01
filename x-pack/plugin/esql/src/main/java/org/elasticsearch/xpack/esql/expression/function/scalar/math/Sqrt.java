@@ -17,6 +17,7 @@ import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.experimental.function.scalar.math.SqrtEsqlKernelEvaluator;
 import org.elasticsearch.xpack.esql.expression.function.Example;
 import org.elasticsearch.xpack.esql.expression.function.FunctionAppliesTo;
 import org.elasticsearch.xpack.esql.expression.function.FunctionAppliesToLifecycle;
@@ -81,7 +82,7 @@ public class Sqrt extends UnaryScalarFunction implements AnyNullIsNull {
         var fieldType = field().dataType();
 
         if (fieldType == DataType.DOUBLE) {
-            return new SqrtDoubleEvaluator.Factory(source(), field);
+            return new SqrtEsqlKernelEvaluator.Factory(source(), field);
         }
         if (fieldType == DataType.INTEGER) {
             return new SqrtIntEvaluator.Factory(source(), field);

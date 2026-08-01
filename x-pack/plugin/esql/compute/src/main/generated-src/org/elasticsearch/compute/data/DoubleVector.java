@@ -26,6 +26,14 @@ public sealed interface DoubleVector extends Vector permits ConstantDoubleVector
     double getDouble(int position);
 
     /**
+     * Returns the zero-based backing array if this vector is backed by one, otherwise {@code null}.
+     * Callers must not mutate the returned array unless they own the vector they are building from it.
+     */
+    default double[] asArray() {
+        return null;
+    }
+
+    /**
      * Copies values from this vector into the destination array.
      */
     default void copyTo(int srcPosition, double[] dst, int dstPosition, int length) {

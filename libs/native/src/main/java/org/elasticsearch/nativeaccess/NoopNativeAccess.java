@@ -104,6 +104,12 @@ class NoopNativeAccess implements NativeAccess {
     }
 
     @Override
+    public Optional<EsqlKernelLibrary> getEsqlKernelLibrary() {
+        logger.warn("cannot get ES|QL expression kernels because native access is not available");
+        return Optional.empty();
+    }
+
+    @Override
     public Optional<ParquetRsFunctions> getParquetRsFunctions() {
         return Optional.empty();
     }

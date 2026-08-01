@@ -30,6 +30,18 @@ tasks.named("test").configure {
   systemProperty "tests.system_call_filter", "false"
 }
 
+tasks.register("compileEsqlKernelCpp") {
+  dependsOn gradle.includedBuild('esql-kernel-native').task(':compileDebugCpp')
+}
+
+tasks.register("linkEsqlKernelCpp") {
+  dependsOn gradle.includedBuild('esql-kernel-native').task(':linkDebug')
+}
+
+tasks.named("assemble").configure {
+  dependsOn "linkEsqlKernelCpp"
+}
+
 tasks.named("forbiddenPatterns").configure {
   exclude '**/*.parquet'
 }
