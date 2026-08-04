@@ -75,6 +75,7 @@ import org.elasticsearch.xpack.esql.plan.logical.TimeSeriesAggregate;
 import org.elasticsearch.xpack.esql.plan.logical.TopNBy;
 import org.elasticsearch.xpack.esql.plan.logical.UnionAll;
 import org.elasticsearch.xpack.esql.plan.logical.UnpackDims;
+import org.elasticsearch.xpack.esql.plan.logical.join.InnerJoin;
 import org.elasticsearch.xpack.esql.plan.logical.local.EmptyLocalSupplier;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
 import org.elasticsearch.xpack.esql.plan.logical.promql.AcrossSeriesAggregate;
@@ -85,9 +86,11 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlFunctionCall;
 import org.elasticsearch.xpack.esql.plan.logical.promql.ScalarConversionFunction;
 import org.elasticsearch.xpack.esql.plan.logical.promql.ScalarFunction;
 import org.elasticsearch.xpack.esql.plan.logical.promql.ValueTransformationFunction;
+import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryArithmetic;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryComparison;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryOperator;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinarySet;
+import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.InstantSelector;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatchers;
@@ -100,13 +103,16 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
+import static org.elasticsearch.xpack.esql.core.expression.MetadataAttribute.isTimeSeriesAttributeName;
 import static org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction.withFilter;
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAnd;
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAndNullable;
@@ -131,7 +137,8 @@ import static org.elasticsearch.xpack.esql.plan.logical.promql.AcrossSeriesAggre
  * </pre>
  * Mechanism: a {@link Translation} instance per command; recursive descent via {@code doTranslateNode()} where every AST
  * node produces a {@link IntermediateResult} its parent composes, and the top-level forms (single translateIntermediate,
- * {@code or} union) stitch finished tables.
+ * {@code or} union, vector-match join) stitch finished tables. A vector-match operand is translated by a sub-{@link Translation}
+ * against its own forked command, so the two join inputs share no attribute ids by construction.
  */
 public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.ParameterizedAnalyzerRule<PromqlCommand, AnalyzerContext> {
     // Sentinel bounds for open-ended range queries (PROMQL step=X without explicit start/end): TStep requires explicit bounds,
@@ -216,8 +223,8 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
     /**
      * One translation pass: the command (or an operand fork of it), the analyzer context, and the state of the translateIntermediate
      * being compiled. Independent parts compile separately - like modules - each with its own instance: a narrowed
-     * required header is {@link #withPushDownHeader}, and a union branch translateIntermediate is a fresh instance with its own
-     * step bucket and evaluation time.
+     * required header is {@link #withPushDownHeader}, a union branch or join operand translateIntermediate is a fresh instance with its
+     * own step bucket and evaluation time, and a vector-match operand is a whole sub-translation of its forked command.
      */
     private record Translation(
         PromqlCommand cmd,
@@ -241,7 +248,10 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             return new Translation(cmd, analyzer, stepBucketAlias, pushDownHeader, time);
         }
 
-        /** Translates one union branch with its own step bucket and evaluation time. */
+        /**
+         * Translates one union branch / join operand with its own step bucket and evaluation time, against this
+         * instance's {@link #headerToPushDown} - the interface the surrounding query compiled against.
+         */
         IntermediateResult translateIntermediate(LogicalPlan branch, NameId stepId, NameId valueId) {
             Expression branchTime = cmd.collectEvaluationTimestampForBranch(branch);
             Alias step = canCreateStepBucket() ? emitStepBucketExpression(stepId, branchTime) : null;
@@ -250,8 +260,15 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         }
 
         LogicalPlan translateFinal() {
+            // A vector-matched arithmetic/comparison operator or an `and` set operator matches two series pipelines on shared
+            // keys, so - like a top-level `or` union - it is emitted as its own top-level combining node (an InnerJoin) rather
+            // than folded into a single aggregate; nested matches are handled inside doTranslateBinaryOp instead.
+            if (cmd.promqlPlan() instanceof VectorBinaryOperator op && isJoinOperator(op)) {
+                return doTranslateFinal(doTranslateBinOpHashJoin(op).plan(), false);
+            }
+
             // `or` is the only set operator that adds rows (more series), requiring a top-level multi-branch `UnionAll` that
-            // cannot compose as a single-value sub-expression.
+            // cannot compose as a single-value sub-expression; `and`/`unless` translate as joins inside doTranslateNode.
             // PromQL `or` is left-associative, so flatten the top-level chain into independent branches.
             var branches = new ArrayList<LogicalPlan>();
             flattenUnion(cmd.promqlPlan(), branches);
@@ -328,7 +345,9 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             var plan = ir.plan();
             var valueExpr = ir.value();
             var header = ir.header();
-            Expression timeFilter = emitBySrcTimeFilter(branch);
+            // A vector match self-filters each operand's own source with that operand's own @timestamp; a combined outer
+            // source-time filter would push one operand's @timestamp across both sources - skip over InnerJoin.
+            Expression timeFilter = plan.anyMatch(p -> p instanceof InnerJoin) ? null : emitBySrcTimeFilter(branch);
             var filter = combineAndNullable(Arrays.asList(ir.pendingFilter(), timeFilter));
             if (filter != null) {
                 plan = pushDownSrcTimestampFilter(plan, filter);
@@ -602,8 +621,21 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             return new IntermediateResult(cmd.child(), function);
         }
 
-        /** Translates binary operators by composing the operator as an expression over a shared frame. */
+        /**
+         * Operands that share a frame - the same source grouped the same way - fold into one expression over that
+         * frame. Only operands whose identity differs have to be matched, which goes through {@link #doJoin} over
+         * independently compiled operands. A nested {@code or} keeps the expression-merge path.
+         */
         private IntermediateResult doTranslateBinaryOp(VectorBinaryOperator binaryOp) {
+            boolean nestedUnion = binaryOp instanceof VectorBinarySet set && set.op() == VectorBinarySet.SetOp.UNION;
+            if (nestedUnion == false && (hasVectorMatch(binaryOp) || requiresMatching(binaryOp))) {
+                return doTranslateBinOpHashJoin(binaryOp);
+            }
+            return doTranslateMergeableBinaryOp(binaryOp);
+        }
+
+        /** The scalar fusion path: compose the operator as an expression over one shared frame, no matching involved. */
+        private IntermediateResult doTranslateMergeableBinaryOp(VectorBinaryOperator binaryOp) {
             IntermediateResult left = doTranslateNode(binaryOp.left());
             Expression leftExpr = new ToDouble(left.value().source(), left.value());
             if (binaryOp instanceof VectorBinaryComparison comp && comp.filterMode()) {
@@ -629,6 +661,238 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 : Kind.BEFORE_INITIAL_AGGREGATE;
             IntermediateResult result = new IntermediateResult(plan, null, filter, shape, kind);
             return doTranslateAddValueEval(result, binaryExpr, shape);
+        }
+
+        /**
+         * Translates a vector-matched join operator into an {@link InnerJoin}: each operand becomes an independent series
+         * pipeline, joined on shared {@code step} + label keys, and the result value is computed on the joined rows.
+         * Operands negotiate like any other translation (see {@link #doTranslateAcrossSeriesAgg}): push down the labels
+         * the match needs, and when a side answers with some of them still packed in its identity, widen the demand
+         * with the labels the other side exposed and retry it.
+         */
+        private IntermediateResult doTranslateBinOpHashJoin(VectorBinaryOperator binaryOp) {
+            Header demanded = Header.undefined().including(matchLabels(binaryOp.match()));
+            var firstPhaseRun = withPushDownHeader(demanded);
+            IntermediateResult lhs = firstPhaseRun.doTranslateJoinOperand(binaryOp.left());
+            IntermediateResult rhs = firstPhaseRun.doTranslateJoinOperand(binaryOp.right());
+            if (demanded.success(lhs.header()) == false) {
+                lhs = withPushDownHeader(demanded.including(rhs.header().labels())).doTranslateJoinOperand(binaryOp.left());
+                assert demanded.success(lhs.header()) : "invariant: header [" + demanded + "] expected, got [" + lhs.header() + "]";
+            }
+            if (demanded.success(rhs.header()) == false) {
+                rhs = withPushDownHeader(demanded.including(lhs.header().labels())).doTranslateJoinOperand(binaryOp.right());
+                assert demanded.success(rhs.header()) : "invariant: header [" + demanded + "] expected, got [" + rhs.header() + "]";
+            }
+            return doJoin(lhs, rhs, binaryOp);
+        }
+
+        /**
+         * The labels a match demands from its operands: {@code on(...)} names them, {@code ignoring(...)} names the
+         * ones to leave out of the source's label set, and matching with neither keys on every label. A group modifier
+         * keeps the many side's whole label set on the result, so it also demands all of them.
+         */
+        private List<Attribute> matchLabels(VectorMatch match) {
+            if (match == null || match.filter() == VectorMatch.Filter.NONE || match.grouping() != VectorMatch.Joining.NONE) {
+                return sourceDimensions();
+            }
+            if (match.filter() == VectorMatch.Filter.ON) {
+                return sourceLabels(match.filterLabels());
+            }
+            return sourceDimensions().stream().filter(label -> match.filterLabels().contains(toCanonicalName(label)) == false).toList();
+        }
+
+        /** Every label the source carries. */
+        private List<Attribute> sourceDimensions() {
+            return cmd.child()
+                .output()
+                .stream()
+                .filter(attribute -> attribute instanceof FieldAttribute field && field.isDimension())
+                .filter(attribute -> attribute instanceof TimeSeriesMetadataAttribute == false)
+                .toList();
+        }
+
+        /** The concrete source dimensions backing the given label names. */
+        private List<Attribute> sourceLabels(Collection<String> names) {
+            List<Attribute> dimensions = sourceDimensions();
+            List<Attribute> labels = new ArrayList<>(names.size());
+            for (String name : names) {
+                Attribute dimension = findByName(dimensions, name);
+                if (dimension != null) {
+                    labels.add(dimension);
+                }
+            }
+            return labels;
+        }
+
+        /** The join combinator over two independently compiled operand tables. */
+        private IntermediateResult doJoin(IntermediateResult lhs, IntermediateResult rhs, VectorBinaryOperator binaryOp) {
+            var match = binaryOp.match() != null
+                ? binaryOp.match()
+                : new VectorMatch(VectorMatch.Filter.NONE, Set.of(), VectorMatch.Joining.NONE, Set.of());
+            IntermediateResult probe = match.grouping() == VectorMatch.Joining.RIGHT ? rhs : lhs;
+            IntermediateResult build = match.grouping() == VectorMatch.Joining.RIGHT ? lhs : rhs;
+            LogicalPlan probePlan = probe.plan();
+            LogicalPlan buildPlan = build.plan();
+
+            List<String> keyNames = matchKeyNames(match, binaryOp.left(), binaryOp.right());
+            Attribute probeStep = findByName(probePlan.output(), cmd.stepColumnName());
+            Attribute buildStep = findByName(buildPlan.output(), cmd.stepColumnName());
+            List<Attribute> probeFields = new ArrayList<>(List.of(probeStep));
+            List<Attribute> buildFields = new ArrayList<>(List.of(buildStep));
+            List<Alias> absentLabels = new ArrayList<>();
+            if (match.filter() != VectorMatch.Filter.NONE) {
+                List<Alias> probeFillers = new ArrayList<>();
+                List<Alias> buildFillers = new ArrayList<>();
+                for (String label : keyNames) {
+                    Attribute probeKey = probe.header().column(label);
+                    Attribute buildKey = build.header().column(label);
+                    if (probeKey == null && buildKey == null) {
+                        if (match.filter() == VectorMatch.Filter.ON) {
+                            absentLabels.add(new Alias(cmd.source(), label, new Literal(cmd.source(), null, DataType.KEYWORD)));
+                        }
+                        continue;
+                    }
+                    if (probeKey == null) {
+                        probeKey = nullKey(label, buildKey.dataType(), probeFillers);
+                    }
+                    if (buildKey == null) {
+                        buildKey = nullKey(label, probeKey.dataType(), buildFillers);
+                    }
+                    probeFields.add(probeKey);
+                    buildFields.add(buildKey);
+                }
+                if (probeFillers.isEmpty() == false) {
+                    probePlan = new Eval(cmd.source(), probePlan, probeFillers);
+                }
+                if (buildFillers.isEmpty() == false) {
+                    buildPlan = new Eval(cmd.source(), buildPlan, buildFillers);
+                }
+            } else {
+                // The unmatched forms key on the labels both operands declare. Only named columns qualify: a packed
+                // `_timeseries` identity is never a join key.
+                for (Attribute probeAttr : probe.header().labels()) {
+                    Attribute buildAttr = build.header().column(toCanonicalName(probeAttr));
+                    if (buildAttr != null) {
+                        probeFields.add(probeAttr);
+                        buildFields.add(buildAttr);
+                    }
+                }
+            }
+
+            // The columns the join copies from the build side onto every matched probe row: its value, plus the labels a
+            // group modifier names. A copied label shadows the probe's own column of that name.
+            List<Attribute> copied = new ArrayList<>(List.of(build.valueColumn()));
+            List<Attribute> shadowed = new ArrayList<>();
+            for (String label : match.groupingLabels()) {
+                if (keyNames.contains(label)) {
+                    continue;
+                }
+                Attribute fromBuild = build.header().column(label);
+                Attribute own = probe.header().column(label);
+                if (fromBuild != null) {
+                    copied.add(fromBuild);
+                    if (own != null) {
+                        shadowed.add(own);
+                    }
+                } else if (own == null) {
+                    absentLabels.add(new Alias(cmd.source(), label, new Literal(cmd.source(), null, DataType.KEYWORD)));
+                }
+            }
+            // InnerJoin exposes the copied columns in build-output order and the physical plan assigns their channels in
+            // the order of this list, so the two must agree.
+            List<Attribute> added = buildPlan.output().stream().filter(attr -> contains(copied, attr)).toList();
+
+            Expression lhsExpr = new ToDouble(lhs.value().source(), lhs.value());
+            Expression rhsExpr = new ToDouble(rhs.value().source(), rhs.value());
+
+            boolean oneToOne = match.grouping() == VectorMatch.Joining.NONE;
+            InnerJoin fullJoin = new InnerJoin(cmd.source(), probePlan, buildPlan, probeFields, buildFields, added, oneToOne);
+
+            LogicalPlan join = fullJoin;
+            Expression result = lhsExpr;
+            Expression filter = null;
+            switch (binaryOp) {
+                case VectorBinarySet ignored -> {
+                    var keys = new ArrayList<NamedExpression>(buildFields);
+                    var distinct = new Aggregate(buildPlan.source(), buildPlan, new ArrayList<>(keys), keys);
+                    join = new InnerJoin(cmd.source(), probePlan, distinct, probeFields, buildFields, List.of(), false);
+                }
+                case VectorBinaryComparison comparison -> {
+                    Expression compare = comparison.op().asFunction().create(binaryOp.source(), lhsExpr, rhsExpr, configuration());
+                    if (comparison.filterMode()) {
+                        filter = compare;
+                    } else {
+                        result = new ToDouble(compare.source(), compare);
+                    }
+                }
+                case VectorBinaryArithmetic arith -> result = arith.op()
+                    .asFunction()
+                    .create(binaryOp.source(), lhsExpr, rhsExpr, configuration());
+            }
+
+            Alias stepAlias = new Alias(probeStep.source(), probeStep.name(), probeStep, cmd.stepId());
+            Alias valueAlias = new Alias(binaryOp.source(), cmd.valueColumnName(), result, new NameId());
+            List<Alias> evalFields = new ArrayList<>(List.of(valueAlias, stepAlias));
+            evalFields.addAll(absentLabels);
+            LogicalPlan plan = new Eval(cmd.source(), join, evalFields);
+            if (filter != null) {
+                plan = new Filter(binaryOp.source(), plan, filter);
+            }
+
+            List<Attribute> projected = new ArrayList<>(List.of(valueAlias.toAttribute(), stepAlias.toAttribute()));
+            absentLabels.forEach(a -> projected.add(a.toAttribute()));
+            // Everything the join emits except the operands' own plumbing: both value columns, the raw probe step
+            // (re-aliased above) and the probe labels a group modifier copy shadows. What of it reaches the response
+            // is decided by the operator's declared output, enforced by the command's final projection.
+            List<Attribute> plumbing = new ArrayList<>(List.of(probe.valueColumn(), build.valueColumn(), probeStep));
+            plumbing.addAll(shadowed);
+            for (Attribute attr : join.output()) {
+                if (contains(plumbing, attr) == false) {
+                    projected.add(attr);
+                }
+            }
+            plan = new Project(cmd.source(), plan, projected);
+
+            Header joinedHeader = hasVectorMatch(binaryOp)
+                ? headerFromOutput(binaryOp.output())
+                : headerFromPlan(plan, cmd.valueColumnName(), cmd.stepColumnName());
+            return new IntermediateResult(plan, valueAlias.toAttribute(), null, joinedHeader, Kind.AFTER_INITIAL_AGGREGATE);
+        }
+
+        /** A null-valued stand-in for a join key label an operand cannot produce: PromQL's "absent label is empty". */
+        private Attribute nullKey(String label, DataType type, List<Alias> fillers) {
+            Alias filler = new Alias(cmd.source(), label, new Literal(cmd.source(), null, type));
+            fillers.add(filler);
+            return filler.toAttribute();
+        }
+
+        /**
+         * Translates one operand of a vector-matched binary operator with a sub-{@link Translation} against its own
+         * independent copy of the source, so the two join operands share no attribute ids by construction.
+         */
+        private IntermediateResult doTranslateJoinOperand(LogicalPlan operand) {
+            Map<NameId, NameId> ids = new HashMap<>();
+            LogicalPlan forkedChild = cmd.child().transformExpressionsDown(Expression.class, e -> reidExpr(e, ids));
+            LogicalPlan forkedFragment = operand.transformExpressionsDown(Expression.class, e -> reidExpr(e, ids));
+            Expression forkedTimestamp = cmd.timestamp() == null ? null : reidExpr(cmd.timestamp(), ids);
+            Header forkedDemand = mapHeaderAttributes(headerToPushDown, ids);
+            PromqlCommand fork = new PromqlCommand(
+                cmd.source(),
+                forkedChild,
+                forkedFragment,
+                cmd.start(),
+                cmd.end(),
+                cmd.step(),
+                cmd.buckets(),
+                cmd.scrapeInterval(),
+                TemporaryNameGenerator.locallyUniqueTemporaryName(cmd.valueColumnName()),
+                forkedTimestamp
+            );
+            return new Translation(fork, analyzer, null, forkedDemand, null).translateIntermediate(
+                fork.promqlPlan(),
+                fork.stepId(),
+                fork.valueId()
+            );
         }
 
         /** Fold left and right aggregates into a single plan. */
@@ -842,6 +1106,11 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             for (var attr : plan.output()) {
                 lookupMap.put(attr.name(), attr);
             }
+            // Under a passthrough mapping the plan carries the concrete field (`labels.instance`) while a match key
+            // the operator declared itself is named for the label alone, so fall back to the canonical name.
+            for (var attr : plan.output()) {
+                lookupMap.putIfAbsent(toCanonicalName(attr), attr);
+            }
             var projected = new ArrayList<>(cmd.output());
             var evals = new ArrayList<Alias>();
             for (int i = 0; i < projected.size(); i++) {
@@ -956,6 +1225,138 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
     }
 
     // -- pure helpers, independent of the running translation --
+
+    /** A binary operator translated to an {@link InnerJoin}: arithmetic/comparison with on/ignoring matching, or {@code and}. */
+    private static boolean isJoinOperator(VectorBinaryOperator op) {
+        return op instanceof VectorBinarySet set ? set.op() == VectorBinarySet.SetOp.INTERSECT : hasVectorMatch(op);
+    }
+
+    /**
+     * The label names a vector match keys on. {@code on(...)} names them explicitly; {@code ignoring(...)} keys on every
+     * label the operands declare, minus the ignored ones.
+     */
+    private static List<String> matchKeyNames(VectorMatch match, LogicalPlan left, LogicalPlan right) {
+        if (match.filter() == VectorMatch.Filter.ON) {
+            return List.copyOf(match.filterLabels());
+        }
+        List<String> names = new ArrayList<>();
+        var seen = new LinkedHashSet<String>();
+        for (Attribute attr : unionPlanOutputs(left, right)) {
+            String name = toCanonicalName(attr);
+            if (isTimeSeriesAttributeName(attr.name()) == false && match.filterLabels().contains(name) == false && seen.add(name)) {
+                names.add(name);
+            }
+        }
+        return names;
+    }
+
+    /** Whether the node evaluates to a PromQL scalar (one value per step, no labelset to vector-match on). */
+    private static boolean isScalar(LogicalPlan node) {
+        return switch (node) {
+            case LiteralSelector ignored -> true;
+            case ScalarFunction ignored -> true;
+            case ScalarConversionFunction ignored -> true;
+            case VectorBinaryOperator op -> isScalar(op.left()) && isScalar(op.right());
+            default -> false;
+        };
+    }
+
+    /** Whether {@code attributes} holds the given column, comparing by attribute identity. */
+    private static boolean contains(List<Attribute> attributes, Attribute candidate) {
+        return attributes.stream().anyMatch(candidate::semanticEquals);
+    }
+
+    /**
+     * Whether the operands have to be matched rather than folded. A scalar applies elementwise, and two vectors read
+     * from the same source with the same grouping already sit in one frame - their labels line up row by row - so only
+     * differing identities need a join.
+     */
+    private static boolean requiresMatching(VectorBinaryOperator op) {
+        if (isScalar(op.left()) || isScalar(op.right())) {
+            return false;
+        }
+        return labelNames(op.left()).equals(labelNames(op.right())) == false;
+    }
+
+    private static Set<String> labelNames(LogicalPlan plan) {
+        var names = new LinkedHashSet<String>();
+        plan.output().forEach(attr -> names.add(toCanonicalName(attr)));
+        return names;
+    }
+
+    /** Whether the operator declares explicit vector matching (on/ignoring, group_left/right). */
+    private static boolean hasVectorMatch(VectorBinaryOperator op) {
+        VectorMatch match = op.match();
+        return match != null && (match.filter() != VectorMatch.Filter.NONE || match.grouping() != VectorMatch.Joining.NONE);
+    }
+
+    private static Header headerFromOutput(List<Attribute> output) {
+        List<Attribute> labels = new ArrayList<>();
+        TimeSeriesColumn ts = null;
+        for (Attribute attr : output) {
+            if (isTimeSeriesAttributeName(attr.name())) {
+                ts = new TimeSeriesColumn(attr, List.of());
+            } else {
+                labels.add(attr);
+            }
+        }
+        Header header = Header.undefined().including(labels);
+        return ts != null ? header.including(ts) : header;
+    }
+
+    private static Header headerFromPlan(LogicalPlan plan, String valueColumnName, String stepColumnName) {
+        List<Attribute> labels = new ArrayList<>();
+        TimeSeriesColumn ts = null;
+        for (Attribute attr : plan.output()) {
+            if (attr.name().equals(valueColumnName) || attr.name().equals(stepColumnName)) {
+                continue;
+            }
+            if (isTimeSeriesAttributeName(attr.name())) {
+                ts = new TimeSeriesColumn(attr, List.of());
+            } else {
+                labels.add(attr);
+            }
+        }
+        Header header = Header.undefined().including(labels);
+        return ts != null ? header.including(ts) : header;
+    }
+
+    private static Header mapHeaderAttributes(Header header, Map<NameId, NameId> ids) {
+        return header.transformExpressions((column, grouping) -> {
+            if (column instanceof TimeSeriesColumn tc) {
+                List<Attribute> exclusions = tc.exclusions().stream().map(a -> (Attribute) reidExpr(a, ids)).toList();
+                return new TimeSeriesColumn((NamedExpression) reidExpr(tc.attribute(), ids), exclusions);
+            }
+            return new NamedColumn((NamedExpression) reidExpr(column.attribute(), ids));
+        });
+    }
+
+    private static List<Attribute> unionPlanOutputs(LogicalPlan left, LogicalPlan right) {
+        var result = new ArrayList<Attribute>(left.output().size() + right.output().size());
+        var seen = new LinkedHashSet<String>();
+        for (Attribute attr : left.output()) {
+            if (seen.add(toCanonicalName(attr))) {
+                result.add(attr);
+            }
+        }
+        for (Attribute attr : right.output()) {
+            if (seen.add(toCanonicalName(attr))) {
+                result.add(attr);
+            }
+        }
+        return result;
+    }
+
+    /** Re-ids a single attribute/alias (leaving other expressions untouched), reusing the shared map for consistency. */
+    private static Expression reidExpr(Expression e, Map<NameId, NameId> ids) {
+        if (e instanceof Attribute a) {
+            return a.withId(ids.computeIfAbsent(a.id(), k -> new NameId()));
+        }
+        if (e instanceof Alias a) {
+            return a.withId(ids.computeIfAbsent(a.id(), k -> new NameId()));
+        }
+        return e;
+    }
 
     /** Flattens a left-associative top-level {@code or} chain into branches; branch 0 has the highest precedence. */
     private static void flattenUnion(LogicalPlan node, List<LogicalPlan> branches) {

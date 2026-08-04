@@ -109,17 +109,12 @@ public class HashJoinExec extends BinaryExec implements EstimatesRowSize {
     public List<Attribute> output() {
         if (lazyOutput == null) {
             List<Attribute> leftOutputWithoutKeys = left().output().stream().filter(attr -> leftFields.contains(attr) == false).toList();
-            List<Attribute> rightWithAppendedKeys = new ArrayList<>(right().output());
-            rightWithAppendedKeys.removeAll(rightFields);
-            rightWithAppendedKeys.addAll(leftFields);
+            // The join copies the added fields onto each probe row and nothing else, so any other build column - a
+            // passthrough alias of a key, say - must stay out of the output, or it takes a channel nothing fills.
+            List<Attribute> addedWithAppendedKeys = new ArrayList<>(addedFields);
+            addedWithAppendedKeys.addAll(leftFields);
 
-            for (Attribute f : addedFields) {
-                if (right().outputSet().contains(f) == false) {
-                    rightWithAppendedKeys.add(f);
-                }
-            }
-
-            lazyOutput = mergeOutputAttributes(rightWithAppendedKeys, leftOutputWithoutKeys);
+            lazyOutput = mergeOutputAttributes(addedWithAppendedKeys, leftOutputWithoutKeys);
         }
         return lazyOutput;
     }

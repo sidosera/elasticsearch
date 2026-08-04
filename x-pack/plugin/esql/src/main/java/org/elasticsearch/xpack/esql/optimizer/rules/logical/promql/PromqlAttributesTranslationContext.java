@@ -136,14 +136,30 @@ public final class PromqlAttributesTranslationContext {
             return including(required);
         }
 
-        /** Whether a returned header exposes every time-series identity this demand requires. */
+        /**
+         * Whether a returned header exposes everything this demand requires: every required time-series identity, and
+         * every required label either as a column or provably dropped by the returned identity (absent, in PromQL
+         * terms, rather than packed away).
+         */
         public boolean success(Header header) {
             for (Column column : columns) {
-                if (column instanceof TimeSeriesColumn tc && header.timeSeries(tc.exclusions()) == null) {
+                boolean satisfied = switch (column) {
+                    case TimeSeriesColumn tc -> header.timeSeries(tc.exclusions()) != null;
+                    case NamedColumn nc -> header.exposes(toCanonicalName(nc.attribute()));
+                };
+                if (satisfied == false) {
                     return false;
                 }
             }
             return true;
+        }
+
+        private boolean exposes(String label) {
+            if (column(label) != null) {
+                return true;
+            }
+            TimeSeriesColumn identity = groupByTimeSeries();
+            return identity != null && toCanonicalNames(identity.exclusions()).contains(label);
         }
 
         /** The named columns of this header; on a demand, the labels a parent requires. */

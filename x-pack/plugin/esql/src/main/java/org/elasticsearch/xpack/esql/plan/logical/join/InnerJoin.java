@@ -81,7 +81,7 @@ public class InnerJoin extends Join implements SortPreserving {
     public List<Attribute> output() {
         if (lazyOutput == null) {
             lazyOutput = mergeOutputAttributes(
-                concat(right().output().stream().filter(not(rightFields()::contains)), leftFields().stream()).toList(),
+                concat(addedFields.stream(), leftFields().stream()).toList(),
                 left().output().stream().filter(not(leftFields()::contains)).toList()
             );
         }
