@@ -666,24 +666,13 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         /**
          * Translates a vector-matched join operator into an {@link InnerJoin}: each operand becomes an independent series
          * pipeline, joined on shared {@code step} + label keys, and the result value is computed on the joined rows.
-         * Operands negotiate like any other translation (see {@link #doTranslateAcrossSeriesAgg}): push down the labels
-         * the match needs, and when a side answers with some of them still packed in its identity, widen the demand
-         * with the labels the other side exposed and retry it.
+         * The operands compile against the labels the match keys on, like any other header push-down: a demanded label
+         * comes back as a concrete column wherever the operand can carry it, and a label the operand dropped stays
+         * absent and null-fills at the join.
          */
         private IntermediateResult doTranslateBinOpHashJoin(VectorBinaryOperator binaryOp) {
-            Header demanded = Header.undefined().including(matchLabels(binaryOp.match()));
-            var firstPhaseRun = withPushDownHeader(demanded);
-            IntermediateResult lhs = firstPhaseRun.doTranslateJoinOperand(binaryOp.left());
-            IntermediateResult rhs = firstPhaseRun.doTranslateJoinOperand(binaryOp.right());
-            if (demanded.success(lhs.header()) == false) {
-                lhs = withPushDownHeader(demanded.including(rhs.header().labels())).doTranslateJoinOperand(binaryOp.left());
-                assert demanded.success(lhs.header()) : "invariant: header [" + demanded + "] expected, got [" + lhs.header() + "]";
-            }
-            if (demanded.success(rhs.header()) == false) {
-                rhs = withPushDownHeader(demanded.including(lhs.header().labels())).doTranslateJoinOperand(binaryOp.right());
-                assert demanded.success(rhs.header()) : "invariant: header [" + demanded + "] expected, got [" + rhs.header() + "]";
-            }
-            return doJoin(lhs, rhs, binaryOp);
+            Translation operands = withPushDownHeader(Header.undefined().including(matchLabels(binaryOp.match())));
+            return doJoin(operands.doTranslateJoinOperand(binaryOp.left()), operands.doTranslateJoinOperand(binaryOp.right()), binaryOp);
         }
 
         /**
@@ -779,6 +768,20 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 }
             }
 
+            // A dimension can be multivalued, which the lookup table cannot key on. Pack each side's label keys into
+            // one single-valued column and join on [step, pack]: pack equality compares each match label as a whole
+            // value. Unlike the series identity (`_timeseries`, which also carries `__name__`), the pack covers
+            // exactly the labels the match keys on, so it can match across metrics.
+            Attribute probePack = null;
+            if (probeFields.size() > 1) {
+                probePack = PackDims.newPackedAttribute(cmd.source());
+                Attribute buildPack = PackDims.newPackedAttribute(cmd.source());
+                probePlan = new PackDims(cmd.source(), probePlan, List.copyOf(probeFields.subList(1, probeFields.size())), probePack);
+                buildPlan = new PackDims(cmd.source(), buildPlan, List.copyOf(buildFields.subList(1, buildFields.size())), buildPack);
+                probeFields = new ArrayList<>(List.of(probeStep, probePack));
+                buildFields = new ArrayList<>(List.of(buildStep, buildPack));
+            }
+
             // The columns the join copies from the build side onto every matched probe row: its value, plus the labels a
             // group modifier names. A copied label shadows the probe's own column of that name.
             List<Attribute> copied = new ArrayList<>(List.of(build.valueColumn()));
@@ -846,6 +849,9 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             // is decided by the operator's declared output, enforced by the command's final projection.
             List<Attribute> plumbing = new ArrayList<>(List.of(probe.valueColumn(), build.valueColumn(), probeStep));
             plumbing.addAll(shadowed);
+            if (probePack != null) {
+                plumbing.add(probePack);
+            }
             for (Attribute attr : join.output()) {
                 if (contains(plumbing, attr) == false) {
                     projected.add(attr);
@@ -1267,21 +1273,15 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
     }
 
     /**
-     * Whether the operands have to be matched rather than folded. A scalar applies elementwise, and two vectors read
-     * from the same source with the same grouping already sit in one frame - their labels line up row by row - so only
-     * differing identities need a join.
+     * Whether the operands have to be matched rather than folded. A scalar applies elementwise, and two identical
+     * operands - the same selector under the same grouping - describe one frame whose rows already line up, so the
+     * operator composes as an expression over it. Anything else is a pair of tables and needs a join.
      */
     private static boolean requiresMatching(VectorBinaryOperator op) {
         if (isScalar(op.left()) || isScalar(op.right())) {
             return false;
         }
-        return labelNames(op.left()).equals(labelNames(op.right())) == false;
-    }
-
-    private static Set<String> labelNames(LogicalPlan plan) {
-        var names = new LinkedHashSet<String>();
-        plan.output().forEach(attr -> names.add(toCanonicalName(attr)));
-        return names;
+        return op.left().equals(op.right()) == false;
     }
 
     /** Whether the operator declares explicit vector matching (on/ignoring, group_left/right). */

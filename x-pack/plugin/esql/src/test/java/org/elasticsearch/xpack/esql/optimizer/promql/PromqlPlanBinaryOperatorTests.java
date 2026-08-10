@@ -31,6 +31,7 @@ import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.MvExpand;
+import org.elasticsearch.xpack.esql.plan.logical.PackDims;
 import org.elasticsearch.xpack.esql.plan.logical.Row;
 import org.elasticsearch.xpack.esql.plan.logical.TimeSeriesAggregate;
 import org.elasticsearch.xpack.esql.plan.logical.TimeSeriesCollapse;
@@ -489,8 +490,9 @@ public class PromqlPlanBinaryOperatorTests extends AbstractPromqlPlanOptimizerTe
         assertThat(joins, hasSize(1));
         InnerJoin join = joins.getFirst();
         assertThat(join.unique(), equalTo(true));
-        assertThat(join.leftFields().stream().map(Attribute::name).toList(), containsInAnyOrder("step", "cluster"));
-        assertThat(join.rightFields().stream().map(Attribute::name).toList(), containsInAnyOrder("step", "cluster"));
+        assertThat(join.leftFields().getFirst().name(), equalTo("step"));
+        assertThat(keyedLabels(join.left()), containsInAnyOrder("cluster"));
+        assertThat(keyedLabels(join.right()), containsInAnyOrder("cluster"));
     }
 
     public void testVectorMatchGroupLeftIsManyToOne() {
@@ -503,8 +505,8 @@ public class PromqlPlanBinaryOperatorTests extends AbstractPromqlPlanOptimizerTe
         assertThat(joins, hasSize(1));
         InnerJoin join = joins.getFirst();
         assertThat(join.unique(), equalTo(false));
-        assertThat(join.leftFields().stream().map(Attribute::name).toList(), containsInAnyOrder("step", "cluster"));
-        assertThat(join.rightFields().stream().map(Attribute::name).toList(), containsInAnyOrder("step", "cluster"));
+        assertThat(keyedLabels(join.left()), containsInAnyOrder("cluster"));
+        assertThat(keyedLabels(join.right()), containsInAnyOrder("cluster"));
     }
 
     public void testVectorMatchGroupRightSwapsInputs() {
@@ -518,7 +520,7 @@ public class PromqlPlanBinaryOperatorTests extends AbstractPromqlPlanOptimizerTe
         InnerJoin join = joins.getFirst();
         assertThat(join.unique(), equalTo(false));
         // After the swap the probe (left of the join) is the RHS "many" side, grouped by (cluster, pod).
-        assertThat(join.leftFields().stream().map(Attribute::name).toList(), containsInAnyOrder("step", "cluster"));
+        assertThat(keyedLabels(join.left()), containsInAnyOrder("cluster"));
     }
 
     public void testVectorMatchComparisonBoolProducesInnerJoin() {
@@ -528,7 +530,7 @@ public class PromqlPlanBinaryOperatorTests extends AbstractPromqlPlanOptimizerTe
         );
         var joins = plan.collect(InnerJoin.class);
         assertThat(joins, hasSize(1));
-        assertThat(joins.getFirst().leftFields().stream().map(Attribute::name).toList(), containsInAnyOrder("step", "cluster"));
+        assertThat(keyedLabels(joins.getFirst().left()), containsInAnyOrder("cluster"));
     }
 
     public void testVectorMatchComparisonFilterProducesInnerJoinAndFilter() {
@@ -580,7 +582,7 @@ public class PromqlPlanBinaryOperatorTests extends AbstractPromqlPlanOptimizerTe
         );
         var joins = plan.collect(InnerJoin.class);
         assertThat(joins, hasSize(1));
-        assertThat(joins.getFirst().leftFields().stream().map(Attribute::name).toList(), containsInAnyOrder("step", "cluster"));
+        assertThat(keyedLabels(joins.getFirst().left()), containsInAnyOrder("cluster"));
     }
 
     public void testVectorMatchNestedInScalarArithmetic() {
@@ -627,4 +629,10 @@ public class PromqlPlanBinaryOperatorTests extends AbstractPromqlPlanOptimizerTe
             .findFirst()
             .orElseThrow();
     }
+
+    /** The labels a join side is keyed on: the join keys are {@code [step, pack]} and the pack carries the labels. */
+    private static List<String> keyedLabels(LogicalPlan joinSide) {
+        return as(joinSide, PackDims.class).dims().stream().map(Attribute::name).toList();
+    }
+
 }

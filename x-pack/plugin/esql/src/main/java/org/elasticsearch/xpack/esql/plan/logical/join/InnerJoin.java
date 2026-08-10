@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.esql.plan.logical.join;
 
 import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.xpack.esql.common.Failures;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
@@ -97,6 +98,14 @@ public class InnerJoin extends Join implements SortPreserving {
     public boolean expressionsResolved() {
         return true;
     }
+
+    /**
+     * The user-facing LOOKUP JOIN key-type restrictions do not apply: the translator constructs both key sides
+     * pairwise ({@code step} against {@code step}, packed labels against packed labels), so the types line up by
+     * construction.
+     */
+    @Override
+    public void postAnalysisVerification(Failures failures) {}
 
     /**
      * Finds the first (bottom-up) {@link InnerJoin} whose right subquery has not yet been replaced with results.
