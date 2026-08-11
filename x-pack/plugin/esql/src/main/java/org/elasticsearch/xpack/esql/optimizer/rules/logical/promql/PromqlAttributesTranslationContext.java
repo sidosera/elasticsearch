@@ -9,11 +9,14 @@ package org.elasticsearch.xpack.esql.optimizer.rules.logical.promql;
 
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
+import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.plan.logical.promql.AcrossSeriesAggregate;
+import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -77,6 +80,27 @@ public final class PromqlAttributesTranslationContext {
         /** No series identity; as a demand, no requirement. */
         public static Header undefined() {
             return new Header(List.of(), List.of());
+        }
+
+        /**
+         * The header over the given attributes: their named labels plus, when present, the packed time-series
+         * identity. Attributes with an excluded name carry no label (a value or step column).
+         */
+        public static Header fromAttributes(List<Attribute> attributes, Set<String> excludedNames) {
+            List<Attribute> labels = new ArrayList<>();
+            TimeSeriesColumn timeSeries = null;
+            for (Attribute attribute : attributes) {
+                if (excludedNames.contains(attribute.name())) {
+                    continue;
+                }
+                if (MetadataAttribute.isTimeSeriesAttributeName(attribute.name())) {
+                    timeSeries = new TimeSeriesColumn(attribute, List.of());
+                } else {
+                    labels.add(attribute);
+                }
+            }
+            Header header = undefined().including(labels);
+            return timeSeries != null ? header.including(timeSeries) : header;
         }
 
         /** Add named column requirements without changing the primary grouping. */
@@ -310,6 +334,64 @@ public final class PromqlAttributesTranslationContext {
             }
             return result;
         }
+    }
+
+    /** A vector-match join key: one matched label and the column each operand exposes for it, either possibly null. */
+    public record MatchKey(String label, Attribute probe, Attribute build) {
+        public boolean absent() {
+            return probe == null && build == null;
+        }
+    }
+
+    /**
+     * The label names a vector match keys on. {@code on(...)} names them (even ones the universe does not know, which
+     * stay absent on both sides); {@code ignoring(...)} keys on the labels the operands declare minus the ignored ones
+     * - an opaque operand declares none, so its packed identity is never a key; matching with neither keys on every
+     * label of the universe.
+     */
+    public static List<String> matchKeyNames(VectorMatch match, List<Attribute> declared, List<Attribute> universe) {
+        if (match != null && match.filter() == VectorMatch.Filter.ON) {
+            return List.copyOf(match.filterLabels());
+        }
+        List<Attribute> keyed = match != null && match.filter() == VectorMatch.Filter.IGNORING ? declared : universe;
+        Set<String> ignored = match != null ? match.filterLabels() : Set.of();
+        return keyed.stream()
+            .map(PromqlAttributesTranslationContext::toCanonicalName)
+            .filter(name -> MetadataAttribute.isTimeSeriesAttributeName(name) == false && ignored.contains(name) == false)
+            .distinct()
+            .toList();
+    }
+
+    /**
+     * The labels a match demands its operands expose as columns: the ones it keys on, widened to the whole universe
+     * when a group modifier keeps the many side's full label set on the result.
+     */
+    public static List<Attribute> matchDemand(VectorMatch match, List<Attribute> declared, List<Attribute> universe) {
+        if (match == null || match.grouping() != VectorMatch.Joining.NONE) {
+            return universe;
+        }
+        return resolveLabels(matchKeyNames(match, declared, universe), universe);
+    }
+
+    /** The universe attributes backing the given label names; names the universe does not know are left out. */
+    public static List<Attribute> resolveLabels(Collection<String> names, List<Attribute> universe) {
+        List<Attribute> labels = new ArrayList<>(names.size());
+        for (String name : names) {
+            Attribute label = findByName(universe, name);
+            if (label != null) {
+                labels.add(label);
+            }
+        }
+        return labels;
+    }
+
+    /** Pairs every matched label with the columns the two operand headers expose for it. */
+    public static List<MatchKey> matchKeys(Collection<String> names, Header probe, Header build) {
+        List<MatchKey> keys = new ArrayList<>(names.size());
+        for (String name : names) {
+            keys.add(new MatchKey(name, probe.column(name), build.column(name)));
+        }
+        return keys;
     }
 
     /** Links a column to the matching attribute of a plan output; keeps the column unchanged when there is none. */

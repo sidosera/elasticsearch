@@ -60,6 +60,7 @@ import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionReg
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TranslateTimeSeriesAggregate;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.Header;
+import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.MatchKey;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.NamedColumn;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.TimeSeriesColumn;
 import org.elasticsearch.xpack.esql.parser.promql.PromqlLogicalPlanBuilder;
@@ -103,7 +104,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -112,13 +112,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import static org.elasticsearch.xpack.esql.core.expression.MetadataAttribute.isTimeSeriesAttributeName;
 import static org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction.withFilter;
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAnd;
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAndNullable;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.findById;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.findByIdOrName;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.findByName;
+import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.matchDemand;
+import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.matchKeyNames;
+import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.matchKeys;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.resolveColumn;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.toCanonicalName;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.AcrossSeriesAggregate.Grouping.WITHOUT;
@@ -671,23 +673,16 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
          * absent and null-fills at the join.
          */
         private IntermediateResult doTranslateBinOpHashJoin(VectorBinaryOperator binaryOp) {
-            Translation operands = withPushDownHeader(Header.undefined().including(matchLabels(binaryOp.match())));
+            List<Attribute> demanded = matchDemand(binaryOp.match(), declaredLabels(binaryOp), sourceDimensions());
+            Translation operands = withPushDownHeader(Header.undefined().including(demanded));
             return doJoin(operands.doTranslateJoinOperand(binaryOp.left()), operands.doTranslateJoinOperand(binaryOp.right()), binaryOp);
         }
 
-        /**
-         * The labels a match demands from its operands: {@code on(...)} names them, {@code ignoring(...)} names the
-         * ones to leave out of the source's label set, and matching with neither keys on every label. A group modifier
-         * keeps the many side's whole label set on the result, so it also demands all of them.
-         */
-        private List<Attribute> matchLabels(VectorMatch match) {
-            if (match == null || match.filter() == VectorMatch.Filter.NONE || match.grouping() != VectorMatch.Joining.NONE) {
-                return sourceDimensions();
-            }
-            if (match.filter() == VectorMatch.Filter.ON) {
-                return sourceLabels(match.filterLabels());
-            }
-            return sourceDimensions().stream().filter(label -> match.filterLabels().contains(toCanonicalName(label)) == false).toList();
+        /** The labels the operands declare on their own outputs, the key universe of {@code ignoring(...)} matching. */
+        private static List<Attribute> declaredLabels(VectorBinaryOperator binaryOp) {
+            List<Attribute> declared = new ArrayList<>(binaryOp.left().output());
+            declared.addAll(binaryOp.right().output());
+            return declared;
         }
 
         /** Every label the source carries. */
@@ -700,19 +695,6 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 .toList();
         }
 
-        /** The concrete source dimensions backing the given label names. */
-        private List<Attribute> sourceLabels(Collection<String> names) {
-            List<Attribute> dimensions = sourceDimensions();
-            List<Attribute> labels = new ArrayList<>(names.size());
-            for (String name : names) {
-                Attribute dimension = findByName(dimensions, name);
-                if (dimension != null) {
-                    labels.add(dimension);
-                }
-            }
-            return labels;
-        }
-
         /** The join combinator over two independently compiled operand tables. */
         private IntermediateResult doJoin(IntermediateResult lhs, IntermediateResult rhs, VectorBinaryOperator binaryOp) {
             var match = binaryOp.match() != null
@@ -723,49 +705,31 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             LogicalPlan probePlan = probe.plan();
             LogicalPlan buildPlan = build.plan();
 
-            List<String> keyNames = matchKeyNames(match, binaryOp.left(), binaryOp.right());
+            List<String> keyNames = matchKeyNames(match, declaredLabels(binaryOp), sourceDimensions());
             Attribute probeStep = findByName(probePlan.output(), cmd.stepColumnName());
             Attribute buildStep = findByName(buildPlan.output(), cmd.stepColumnName());
             List<Attribute> probeFields = new ArrayList<>(List.of(probeStep));
             List<Attribute> buildFields = new ArrayList<>(List.of(buildStep));
             List<Alias> absentLabels = new ArrayList<>();
-            if (match.filter() != VectorMatch.Filter.NONE) {
-                List<Alias> probeFillers = new ArrayList<>();
-                List<Alias> buildFillers = new ArrayList<>();
-                for (String label : keyNames) {
-                    Attribute probeKey = probe.header().column(label);
-                    Attribute buildKey = build.header().column(label);
-                    if (probeKey == null && buildKey == null) {
-                        if (match.filter() == VectorMatch.Filter.ON) {
-                            absentLabels.add(new Alias(cmd.source(), label, new Literal(cmd.source(), null, DataType.KEYWORD)));
-                        }
-                        continue;
+            List<Alias> probeFillers = new ArrayList<>();
+            List<Alias> buildFillers = new ArrayList<>();
+            for (MatchKey key : matchKeys(keyNames, probe.header(), build.header())) {
+                if (key.absent()) {
+                    // A label absent from both sides matches trivially (empty on each); on(...) still reports it.
+                    if (match.filter() == VectorMatch.Filter.ON) {
+                        absentLabels.add(new Alias(cmd.source(), key.label(), new Literal(cmd.source(), null, DataType.KEYWORD)));
                     }
-                    if (probeKey == null) {
-                        probeKey = nullKey(label, buildKey.dataType(), probeFillers);
-                    }
-                    if (buildKey == null) {
-                        buildKey = nullKey(label, probeKey.dataType(), buildFillers);
-                    }
-                    probeFields.add(probeKey);
-                    buildFields.add(buildKey);
+                    continue;
                 }
-                if (probeFillers.isEmpty() == false) {
-                    probePlan = new Eval(cmd.source(), probePlan, probeFillers);
-                }
-                if (buildFillers.isEmpty() == false) {
-                    buildPlan = new Eval(cmd.source(), buildPlan, buildFillers);
-                }
-            } else {
-                // The unmatched forms key on the labels both operands declare. Only named columns qualify: a packed
-                // `_timeseries` identity is never a join key.
-                for (Attribute probeAttr : probe.header().labels()) {
-                    Attribute buildAttr = build.header().column(toCanonicalName(probeAttr));
-                    if (buildAttr != null) {
-                        probeFields.add(probeAttr);
-                        buildFields.add(buildAttr);
-                    }
-                }
+                // A label only one side carries matches only the other side's absent rows: null-fill that side.
+                probeFields.add(key.probe() != null ? key.probe() : nullKey(key.label(), key.build().dataType(), probeFillers));
+                buildFields.add(key.build() != null ? key.build() : nullKey(key.label(), key.probe().dataType(), buildFillers));
+            }
+            if (probeFillers.isEmpty() == false) {
+                probePlan = new Eval(cmd.source(), probePlan, probeFillers);
+            }
+            if (buildFillers.isEmpty() == false) {
+                buildPlan = new Eval(cmd.source(), buildPlan, buildFillers);
             }
 
             // A dimension can be multivalued, which the lookup table cannot key on. Pack each side's label keys into
@@ -782,43 +746,46 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 buildFields = new ArrayList<>(List.of(buildStep, buildPack));
             }
 
-            // The columns the join copies from the build side onto every matched probe row: its value, plus the labels a
-            // group modifier names. A copied label shadows the probe's own column of that name.
-            List<Attribute> copied = new ArrayList<>(List.of(build.valueColumn()));
+            LogicalPlan buildSide = buildPlan;
+            List<Attribute> added = List.of();
             List<Attribute> shadowed = new ArrayList<>();
-            for (String label : match.groupingLabels()) {
-                if (keyNames.contains(label)) {
-                    continue;
-                }
-                Attribute fromBuild = build.header().column(label);
-                Attribute own = probe.header().column(label);
-                if (fromBuild != null) {
-                    copied.add(fromBuild);
-                    if (own != null) {
-                        shadowed.add(own);
+            boolean semiJoin = binaryOp instanceof VectorBinarySet;
+            if (semiJoin) {
+                // A semi-join keeps probe rows with a matching build key: dedup the build side and copy nothing.
+                var keys = new ArrayList<NamedExpression>(buildFields);
+                buildSide = new Aggregate(buildPlan.source(), buildPlan, new ArrayList<>(keys), keys);
+            } else {
+                // The columns the join copies from the build side onto every matched probe row: its value, plus the
+                // labels a group modifier names. A copied label shadows the probe's own column of that name.
+                List<Attribute> copied = new ArrayList<>(List.of(build.valueColumn()));
+                for (String label : match.groupingLabels()) {
+                    if (keyNames.contains(label)) {
+                        continue;
                     }
-                } else if (own == null) {
-                    absentLabels.add(new Alias(cmd.source(), label, new Literal(cmd.source(), null, DataType.KEYWORD)));
+                    Attribute fromBuild = build.header().column(label);
+                    Attribute own = probe.header().column(label);
+                    if (fromBuild != null) {
+                        copied.add(fromBuild);
+                        if (own != null) {
+                            shadowed.add(own);
+                        }
+                    } else if (own == null) {
+                        absentLabels.add(new Alias(cmd.source(), label, new Literal(cmd.source(), null, DataType.KEYWORD)));
+                    }
                 }
+                // InnerJoin exposes the copied columns in build-output order and the physical plan assigns their
+                // channels in the order of this list, so the two must agree.
+                added = buildPlan.output().stream().filter(attr -> contains(copied, attr)).toList();
             }
-            // InnerJoin exposes the copied columns in build-output order and the physical plan assigns their channels in
-            // the order of this list, so the two must agree.
-            List<Attribute> added = buildPlan.output().stream().filter(attr -> contains(copied, attr)).toList();
+            boolean oneToOne = semiJoin == false && match.grouping() == VectorMatch.Joining.NONE;
+            LogicalPlan join = new InnerJoin(cmd.source(), probePlan, buildSide, probeFields, buildFields, added, oneToOne);
 
             Expression lhsExpr = new ToDouble(lhs.value().source(), lhs.value());
             Expression rhsExpr = new ToDouble(rhs.value().source(), rhs.value());
-
-            boolean oneToOne = match.grouping() == VectorMatch.Joining.NONE;
-            InnerJoin fullJoin = new InnerJoin(cmd.source(), probePlan, buildPlan, probeFields, buildFields, added, oneToOne);
-
-            LogicalPlan join = fullJoin;
             Expression result = lhsExpr;
             Expression filter = null;
             switch (binaryOp) {
                 case VectorBinarySet ignored -> {
-                    var keys = new ArrayList<NamedExpression>(buildFields);
-                    var distinct = new Aggregate(buildPlan.source(), buildPlan, new ArrayList<>(keys), keys);
-                    join = new InnerJoin(cmd.source(), probePlan, distinct, probeFields, buildFields, List.of(), false);
                 }
                 case VectorBinaryComparison comparison -> {
                     Expression compare = comparison.op().asFunction().create(binaryOp.source(), lhsExpr, rhsExpr, configuration());
@@ -860,8 +827,8 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             plan = new Project(cmd.source(), plan, projected);
 
             Header joinedHeader = hasVectorMatch(binaryOp)
-                ? headerFromOutput(binaryOp.output())
-                : headerFromPlan(plan, cmd.valueColumnName(), cmd.stepColumnName());
+                ? Header.fromAttributes(binaryOp.output(), Set.of())
+                : Header.fromAttributes(plan.output(), Set.of(cmd.valueColumnName(), cmd.stepColumnName()));
             return new IntermediateResult(plan, valueAlias.toAttribute(), null, joinedHeader, Kind.AFTER_INITIAL_AGGREGATE);
         }
 
@@ -1237,25 +1204,6 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         return op instanceof VectorBinarySet set ? set.op() == VectorBinarySet.SetOp.INTERSECT : hasVectorMatch(op);
     }
 
-    /**
-     * The label names a vector match keys on. {@code on(...)} names them explicitly; {@code ignoring(...)} keys on every
-     * label the operands declare, minus the ignored ones.
-     */
-    private static List<String> matchKeyNames(VectorMatch match, LogicalPlan left, LogicalPlan right) {
-        if (match.filter() == VectorMatch.Filter.ON) {
-            return List.copyOf(match.filterLabels());
-        }
-        List<String> names = new ArrayList<>();
-        var seen = new LinkedHashSet<String>();
-        for (Attribute attr : unionPlanOutputs(left, right)) {
-            String name = toCanonicalName(attr);
-            if (isTimeSeriesAttributeName(attr.name()) == false && match.filterLabels().contains(name) == false && seen.add(name)) {
-                names.add(name);
-            }
-        }
-        return names;
-    }
-
     /** Whether the node evaluates to a PromQL scalar (one value per step, no labelset to vector-match on). */
     private static boolean isScalar(LogicalPlan node) {
         return switch (node) {
@@ -1290,37 +1238,6 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         return match != null && (match.filter() != VectorMatch.Filter.NONE || match.grouping() != VectorMatch.Joining.NONE);
     }
 
-    private static Header headerFromOutput(List<Attribute> output) {
-        List<Attribute> labels = new ArrayList<>();
-        TimeSeriesColumn ts = null;
-        for (Attribute attr : output) {
-            if (isTimeSeriesAttributeName(attr.name())) {
-                ts = new TimeSeriesColumn(attr, List.of());
-            } else {
-                labels.add(attr);
-            }
-        }
-        Header header = Header.undefined().including(labels);
-        return ts != null ? header.including(ts) : header;
-    }
-
-    private static Header headerFromPlan(LogicalPlan plan, String valueColumnName, String stepColumnName) {
-        List<Attribute> labels = new ArrayList<>();
-        TimeSeriesColumn ts = null;
-        for (Attribute attr : plan.output()) {
-            if (attr.name().equals(valueColumnName) || attr.name().equals(stepColumnName)) {
-                continue;
-            }
-            if (isTimeSeriesAttributeName(attr.name())) {
-                ts = new TimeSeriesColumn(attr, List.of());
-            } else {
-                labels.add(attr);
-            }
-        }
-        Header header = Header.undefined().including(labels);
-        return ts != null ? header.including(ts) : header;
-    }
-
     private static Header mapHeaderAttributes(Header header, Map<NameId, NameId> ids) {
         return header.transformExpressions((column, grouping) -> {
             if (column instanceof TimeSeriesColumn tc) {
@@ -1329,22 +1246,6 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             }
             return new NamedColumn((NamedExpression) reidExpr(column.attribute(), ids));
         });
-    }
-
-    private static List<Attribute> unionPlanOutputs(LogicalPlan left, LogicalPlan right) {
-        var result = new ArrayList<Attribute>(left.output().size() + right.output().size());
-        var seen = new LinkedHashSet<String>();
-        for (Attribute attr : left.output()) {
-            if (seen.add(toCanonicalName(attr))) {
-                result.add(attr);
-            }
-        }
-        for (Attribute attr : right.output()) {
-            if (seen.add(toCanonicalName(attr))) {
-                result.add(attr);
-            }
-        }
-        return result;
     }
 
     /** Re-ids a single attribute/alias (leaving other expressions untouched), reusing the shared map for consistency. */
