@@ -16,7 +16,6 @@ import org.elasticsearch.xpack.esql.core.QlIllegalArgumentException;
 import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
-import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
 import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
@@ -24,7 +23,6 @@ import org.elasticsearch.xpack.esql.core.expression.NameId;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
 import org.elasticsearch.xpack.esql.core.expression.Nullability;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
-import org.elasticsearch.xpack.esql.core.expression.TimeSeriesMetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.predicate.regex.RLikePattern;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
@@ -60,7 +58,6 @@ import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionReg
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TemporaryNameGenerator;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.TranslateTimeSeriesAggregate;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.Header;
-import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.MatchKey;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.NamedColumn;
 import org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.TimeSeriesColumn;
 import org.elasticsearch.xpack.esql.parser.promql.PromqlLogicalPlanBuilder;
@@ -87,7 +84,6 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlFunctionCall;
 import org.elasticsearch.xpack.esql.plan.logical.promql.ScalarConversionFunction;
 import org.elasticsearch.xpack.esql.plan.logical.promql.ScalarFunction;
 import org.elasticsearch.xpack.esql.plan.logical.promql.ValueTransformationFunction;
-import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryArithmetic;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryComparison;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryOperator;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinarySet;
@@ -111,6 +107,8 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
+import java.util.function.UnaryOperator;
 
 import static org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction.withFilter;
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAnd;
@@ -118,12 +116,13 @@ import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combi
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.findById;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.findByIdOrName;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.findByName;
-import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.matchDemand;
-import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.matchKeyNames;
-import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.matchKeys;
+import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.nullColumn;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.resolveColumn;
 import static org.elasticsearch.xpack.esql.optimizer.rules.logical.promql.PromqlAttributesTranslationContext.toCanonicalName;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.AcrossSeriesAggregate.Grouping.WITHOUT;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinarySet.SetOp.UNION;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch.Condition;
+import static org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch.Joining;
 
 /**
  * Translates PromQL logical plan into ESQL plan. Runs before {@link TranslateTimeSeriesAggregate} to convert
@@ -139,8 +138,20 @@ import static org.elasticsearch.xpack.esql.plan.logical.promql.AcrossSeriesAggre
  * </pre>
  * Mechanism: a {@link Translation} instance per command; recursive descent via {@code doTranslateNode()} where every AST
  * node produces a {@link IntermediateResult} its parent composes, and the top-level forms (single translateIntermediate,
- * {@code or} union, vector-match join) stitch finished tables. A vector-match operand is translated by a sub-{@link Translation}
- * against its own forked command, so the two join inputs share no attribute ids by construction.
+ * {@code or} union, vector-match join) stitch finished tables. A vector-match operand is translated like a union branch
+ * (its own step/value ids against the shared command); the build side is then re-identified so the two join inputs
+ * share no attribute ids.
+ * <p>
+ * Every shape-changing node (across-series aggregate, histogram_quantile, vector-match join) runs the same phases:
+ * <ol>
+ * <li><b>translate</b> - compile the subtree(s) optimistically against the surrounding demand;</li>
+ * <li><b>negotiate</b> - derive the node's requirement from the shapes the subtrees actually produced, and translate
+ * once more a subtree missing required columns it can offer ({@link Translation#retried});</li>
+ * <li><b>bind</b> - link the node's symbolic columns to the concrete columns of the produced plans, null-defining
+ * required columns that are genuinely unavailable ({@link Header#bind});</li>
+ * <li><b>emit</b> - assemble the ESQL plan nodes over the bound columns;</li>
+ * <li><b>report</b> - return the produced header for the parent to compose against.</li>
+ * </ol>
  */
 public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.ParameterizedAnalyzerRule<PromqlCommand, AnalyzerContext> {
     // Sentinel bounds for open-ended range queries (PROMQL step=X without explicit start/end): TStep requires explicit bounds,
@@ -223,10 +234,10 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
     }
 
     /**
-     * One translation pass: the command (or an operand fork of it), the analyzer context, and the state of the translateIntermediate
+     * One translation pass: the command, the analyzer context, and the state of the translateIntermediate
      * being compiled. Independent parts compile separately - like modules - each with its own instance: a narrowed
-     * required header is {@link #withPushDownHeader}, a union branch or join operand translateIntermediate is a fresh instance with its
-     * own step bucket and evaluation time, and a vector-match operand is a whole sub-translation of its forked command.
+     * required header is {@link #withPushDownHeader}, and a union branch or a vector-match operand is a fresh
+     * instance with its own step bucket and evaluation time.
      */
     private record Translation(
         PromqlCommand cmd,
@@ -251,8 +262,8 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         }
 
         /**
-         * Translates one union branch / join operand with its own step bucket and evaluation time, against this
-         * instance's {@link #headerToPushDown} - the interface the surrounding query compiled against.
+         * Translates one branch with its own step bucket and evaluation time, against this instance's
+         * {@link #headerToPushDown} - the interface the surrounding query compiled against.
          */
         IntermediateResult translateIntermediate(LogicalPlan branch, NameId stepId, NameId valueId) {
             Expression branchTime = cmd.collectEvaluationTimestampForBranch(branch);
@@ -266,7 +277,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             // keys, so - like a top-level `or` union - it is emitted as its own top-level combining node (an InnerJoin) rather
             // than folded into a single aggregate; nested matches are handled inside doTranslateBinaryOp instead.
             if (cmd.promqlPlan() instanceof VectorBinaryOperator op && isJoinOperator(op)) {
-                return doTranslateFinal(doTranslateBinOpHashJoin(op).plan(), false);
+                return doTranslateFinal(doTranslateBinOpInnerJoin(op).plan(), false);
             }
 
             // `or` is the only set operator that adds rows (more series), requiring a top-level multi-branch `UnionAll` that
@@ -426,33 +437,59 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         }
 
         /**
+         * The <b>translate</b> and <b>negotiate</b> phases for a node with one child: translate the child against a
+         * demand and, when the returned header misses columns the node requires, push the missing columns down and
+         * translate once more. The requirement is a function of the produced header because a node's required columns
+         * (a regrouping, join keys) are only known once the child's shape is. Columns still missing after the retry
+         * are genuinely unavailable and null-define in the <b>bind</b> phase.
+         */
+        private IntermediateResult translateChecked(
+            Header demand,
+            UnaryOperator<Header> requirement,
+            Function<Translation, IntermediateResult> translate
+        ) {
+            IntermediateResult ir = translate.apply(withPushDownHeader(demand));
+            return ir.kind.constant ? ir : retried(ir, demand, requirement.apply(ir.header()), translate);
+        }
+
+        /**
+         * The <b>negotiate</b> phase: when a translated subtree misses required columns, translate it once more with
+         * the missing columns pushed down. A column still missing after the retry is genuinely unavailable and
+         * null-defines in the <b>bind</b> phase.
+         */
+        private IntermediateResult retried(
+            IntermediateResult ir,
+            Header demand,
+            Header required,
+            Function<Translation, IntermediateResult> translate
+        ) {
+            Header missing = required.missing(ir.header());
+            return missing.isDefined() ? translate.apply(withPushDownHeader(demand.plus(missing))) : ir;
+        }
+
+        /**
          * Translates {@code AcrossSeriesAggregate} to an ESQL {@code Aggregate}. PromQL aggregation shape is dynamic and
          * cannot be enumerated at plan time. A parent translates its child, inspects the returned shape, and re-invokes
          * it with an additional load-time identity requirement when necessary. Only {@code AcrossSeriesAggregate}
          * creates plan-level aggregation nodes; within-series aggregates and function calls lower to expressions.
          */
         private IntermediateResult doTranslateAcrossSeriesAgg(AcrossSeriesAggregate agg) {
-            var maybeChildHeader = headerToPushDown.withAcrossSeriesAgg(agg.grouping(), agg.groupings());
-            var fistPhaseRun = withPushDownHeader(maybeChildHeader);
-            IntermediateResult ir = fistPhaseRun.doTranslateNode(agg.child());
+            // translate + negotiate: the child compiles against this demand transposed across the aggregate; the
+            // requirement (the regrouping) is a function of the shape the child produces.
+            Header demand = headerToPushDown.withAcrossSeriesAgg(agg.grouping(), agg.groupings());
+            UnaryOperator<Header> regroup = header -> header.withAcrossSeriesAgg(agg.grouping(), agg.groupings(), agg.output());
+            IntermediateResult ir = translateChecked(demand, regroup, translation -> translation.doTranslateNode(agg.child()));
             if (ir.kind.constant) {
                 return ir;
             }
 
-            // check if push-down successful
-            var childHeader = ir.header;
-            var currHeader = childHeader.withAcrossSeriesAgg(agg.grouping(), agg.groupings(), agg.output());
-            maybeChildHeader = maybeChildHeader.requiring(currHeader);
-            if (maybeChildHeader.success(childHeader) == false) {
-                var secondPhaseRun = withPushDownHeader(maybeChildHeader);
-                ir = secondPhaseRun.doTranslateNode(agg.child());
-                currHeader = ir.header().withAcrossSeriesAgg(agg.grouping(), agg.groupings(), agg.output());
-                maybeChildHeader = maybeChildHeader.requiring(currHeader);
-                assert maybeChildHeader.success(ir.header)
-                    : "invariant: header [" + maybeChildHeader + "] expected, got [" + ir.header + "]";
-            }
-            Header outputHeader = ir.header().regrouped(currHeader, this.headerToPushDown);
+            // report: the regrouped surface, carrying the non-grouping columns the surrounding query demands.
+            Header grouping = regroup.apply(ir.header());
+            assert grouping.missing(ir.header()).hasTimeSeriesColumns() == false
+                : "invariant: identity grouping [" + grouping + "] not covered by [" + ir.header() + "]";
+            Header outputHeader = ir.header().regrouped(grouping, this.headerToPushDown);
 
+            // bind + emit: doTranslateAgg links the header to the child plan and builds the aggregate over it.
             var promqlCtx = new PromqlContext(time, AggregateFunction.NO_WINDOW, stepAttr(), configuration());
             return doTranslateAgg(ir, ir.plan(), outputHeader, agg.grouping() == WITHOUT, agg.buildEsqlFunction(ir.value(), promqlCtx));
         }
@@ -502,7 +539,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             return new TopNBy(
                 reduction.source(),
                 resultPlan,
-                order != null ? List.of(order) : List.<Order>of(),
+                order != null ? List.of(order) : List.of(),
                 new ToInteger(reduction.source(), reduction.parameters().getFirst()),
                 groupings
             );
@@ -526,71 +563,56 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         }
 
         private IntermediateResult doTranslateHq(HistogramQuantile hq) {
-            IntermediateResult firstPhaseResult = doTranslateNode(hq.child());
-            if (firstPhaseResult.kind.constant) {
-                return firstPhaseResult;
+            // translate + negotiate: histogram_quantile is a regroup without the `le` bucket label; the requirement
+            // is empty until the child exposes `le` at all (native histograms and le-less inputs take the paths below).
+            UnaryOperator<Header> regroup = header -> {
+                Attribute bucket = header.column(HistogramQuantile.LE_LABEL);
+                return bucket == null ? Header.undefined() : header.groupedWithout(List.of(bucket));
+            };
+            IntermediateResult ir = translateChecked(headerToPushDown, regroup, translation -> translation.doTranslateNode(hq.child()));
+            if (ir.kind.constant) {
+                return ir;
             }
             var definition = PromqlHistogramQuantile.PROMQL_DEFINITION;
 
             // native histograms - distinguishable only at this point in planning are regular value transformations.
-            if (firstPhaseResult.value().resolved() && firstPhaseResult.value().dataType().isHistogram()) {
+            if (ir.value().resolved() && ir.value().dataType().isHistogram()) {
                 return doTranslateFunc(new ValueTransformationFunction(hq.source(), hq.child(), definition, hq.parameters()));
             }
 
             // classic counter backed histograms need the special treatment below;
-            LogicalPlan childPlan = firstPhaseResult.plan();
-            var le = firstPhaseResult.header().column(HistogramQuantile.LE_LABEL);
+            LogicalPlan childPlan = ir.plan();
+            var le = ir.header().column(HistogramQuantile.LE_LABEL);
             if (le == null) {
                 // like prometheus, return warning and drop series w/o `le`
                 HeaderWarning.addWarning("histogram_quantile: input vector has no le label; no buckets to evaluate");
                 var skipAllFilter = new Filter(hq.source(), childPlan, Literal.FALSE);
                 var nullGrouping = new Values(hq.source(), new Literal(hq.source(), null, DataType.DOUBLE));
-                return doTranslateAgg(firstPhaseResult, skipAllFilter, firstPhaseResult.header(), false, nullGrouping);
+                return doTranslateAgg(ir, skipAllFilter, ir.header(), false, nullGrouping);
             }
 
-            // `le` exists on child plan -> group by `le`
-            Header grouping = firstPhaseResult.header().groupedWithout(List.of(le));
-            Header maybeChildHeader = headerToPushDown.requiring(grouping);
-
-            // check if our parent push-down labels on child plan
-            if (maybeChildHeader.success(firstPhaseResult.header()) == false) {
-                // in addition to `le` preserve our parent push-down labels
-                Translation childTranslation = withPushDownHeader(maybeChildHeader);
-                var secondPhaseResult = childTranslation.doTranslateNode(hq.child());
-                childPlan = secondPhaseResult.plan();
-                le = secondPhaseResult.header().column(HistogramQuantile.LE_LABEL);
-
-                assert le != null : "invariant: [ " + HistogramQuantile.LE_LABEL + " ] required";
-
-                // ?
-                grouping = secondPhaseResult.header().groupedWithout(List.of(le));
-                maybeChildHeader = maybeChildHeader.requiring(grouping);
-
-                firstPhaseResult = secondPhaseResult;
-
-                assert maybeChildHeader.success(secondPhaseResult.header()) : "invariant: [ " + HistogramQuantile.LE_LABEL + " ] required";
-            }
-
-            if (firstPhaseResult.kind.afterInitialAggregation == false) {
-                childPlan = emitInitialAggregate(childPlan, firstPhaseResult.header(), firstPhaseResult.value());
-                firstPhaseResult = new IntermediateResult(
+            // bind + emit: regroup without `le` and build the quantile aggregate over the bound bucket column.
+            Header grouping = regroup.apply(ir.header());
+            if (ir.kind.afterInitialAggregation == false) {
+                childPlan = emitInitialAggregate(childPlan, ir.header(), ir.value());
+                ir = new IntermediateResult(
                     childPlan,
                     collectValueAttribute(childPlan),
-                    firstPhaseResult.pendingFilter(),
-                    firstPhaseResult.header(),
+                    ir.pendingFilter(),
+                    ir.header(),
                     Kind.AFTER_INITIAL_AGGREGATE
                 );
-                le = firstPhaseResult.header().column(HistogramQuantile.LE_LABEL);
+                le = ir.header().column(HistogramQuantile.LE_LABEL);
                 assert le != null : "invariant: [ " + HistogramQuantile.LE_LABEL + " ] required";
             }
 
             // histogram_quantile groups by every label except the `le` bucket label, so `le` is the single excluded
             // dimension - the returned header drops it and the innermost `_timeseries` excludes it. Bucket counts are
             // consumed as doubles; counter buckets are frequently integer/long typed, so cast explicitly.
-            Header header = firstPhaseResult.header().regrouped(grouping, headerToPushDown);
-            Expression count = new ToDouble(hq.source(), firstPhaseResult.value());
+            Header header = ir.header().regrouped(grouping, headerToPushDown);
+            Expression count = new ToDouble(hq.source(), ir.value());
             Expression quantile = new PromqlHistogramQuantile(hq.source(), count, le, hq.quantile());
-            return doTranslateAgg(firstPhaseResult, childPlan, header, true, quantile);
+            return doTranslateAgg(ir, childPlan, header, true, quantile);
         }
 
         /** scalar(): collapse to one value per step, e.g. scalar(sum by (cluster) (metric)). */
@@ -625,19 +647,31 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
 
         /**
          * Operands that share a frame - the same source grouped the same way - fold into one expression over that
-         * frame. Only operands whose identity differs have to be matched, which goes through {@link #doJoin} over
-         * independently compiled operands. A nested {@code or} keeps the expression-merge path.
+         * frame. Only operands whose identity differs have to be matched, which goes through
+         * {@link #doTranslateBinOpInnerJoin} over independently compiled operands. A nested {@code or} keeps the
+         * expression-merge path.
          */
-        private IntermediateResult doTranslateBinaryOp(VectorBinaryOperator binaryOp) {
-            boolean nestedUnion = binaryOp instanceof VectorBinarySet set && set.op() == VectorBinarySet.SetOp.UNION;
-            if (nestedUnion == false && (hasVectorMatch(binaryOp) || requiresMatching(binaryOp))) {
-                return doTranslateBinOpHashJoin(binaryOp);
+        private IntermediateResult doTranslateBinaryOp(VectorBinaryOperator op) {
+            if ((op instanceof VectorBinarySet s && UNION == s.op()) == false) {
+                if (isScalar(op.left()) == false && isScalar(op.right()) == false && op.left().equals(op.right()) == false) {
+                    return doTranslateBinOpInnerJoin(op);
+                }
+                // an explicit modifier forces matching even when the operands would fold
+                if (hasVectorMatch(op)) {
+                    return doTranslateBinOpInnerJoin(op);
+                }
             }
-            return doTranslateMergeableBinaryOp(binaryOp);
+
+            // In cases like:
+            // `avg(...) by(A) + sum(...) by(B)`,
+            // if A = B the result is computed in one pass:
+            // `a=avg(...), b=sum(...), result=a+b by (A)`;
+            // which is cheaper than join.
+            return doTranslateBinaryOpAggregate(op);
         }
 
-        /** The scalar fusion path: compose the operator as an expression over one shared frame, no matching involved. */
-        private IntermediateResult doTranslateMergeableBinaryOp(VectorBinaryOperator binaryOp) {
+        /** compose operator as an expression over shared aggregate */
+        private IntermediateResult doTranslateBinaryOpAggregate(VectorBinaryOperator binaryOp) {
             IntermediateResult left = doTranslateNode(binaryOp.left());
             Expression leftExpr = new ToDouble(left.value().source(), left.value());
             if (binaryOp instanceof VectorBinaryComparison comp && comp.filterMode()) {
@@ -668,204 +702,120 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         /**
          * Translates a vector-matched join operator into an {@link InnerJoin}: each operand becomes an independent series
          * pipeline, joined on shared {@code step} + label keys, and the result value is computed on the joined rows.
-         * The operands compile against the labels the match keys on, like any other header push-down: a demanded label
+         * The operands compile against the labels the join demands, like any other header push-down: a demanded label
          * comes back as a concrete column wherever the operand can carry it, and a label the operand dropped stays
          * absent and null-fills at the join.
          */
-        private IntermediateResult doTranslateBinOpHashJoin(VectorBinaryOperator binaryOp) {
-            List<Attribute> demanded = matchDemand(binaryOp.match(), declaredLabels(binaryOp), sourceDimensions());
-            Translation operands = withPushDownHeader(Header.undefined().including(demanded));
-            return doJoin(operands.doTranslateJoinOperand(binaryOp.left()), operands.doTranslateJoinOperand(binaryOp.right()), binaryOp);
-        }
+        private IntermediateResult doTranslateBinOpInnerJoin(VectorBinaryOperator op) {
+            // translate: the operands compile against the surrounding demand alone; what the join itself needs is
+            // negotiated below, from the shapes the operands actually produced.
+            Function<Translation, IntermediateResult> left = t -> t.translateIntermediate(op.left(), new NameId(), new NameId());
+            Function<Translation, IntermediateResult> right = t -> t.translateIntermediate(op.right(), new NameId(), new NameId());
+            IntermediateResult lhs = left.apply(this);
+            IntermediateResult rhs = right.apply(this);
 
-        /** The labels the operands declare on their own outputs, the key universe of {@code ignoring(...)} matching. */
-        private static List<Attribute> declaredLabels(VectorBinaryOperator binaryOp) {
-            List<Attribute> declared = new ArrayList<>(binaryOp.left().output());
-            declared.addAll(binaryOp.right().output());
-            return declared;
-        }
+            // negotiate: the key set dispatches on the matching mode, over what each side offers (an opaque identity
+            // offers every source label it does not exclude). A plain match keys on the labels both sides offer;
+            // on(...) keys on the named labels wherever either side offers them (the other side's key binds to null,
+            // matching PromQL's absent-label-equals-empty rule); ignoring(...) removes the named labels from the
+            // plain intersection. Each side is then asked for the keys plus the labels the node's declared output
+            // must expose (on(...) keys and group modifier labels), and a side whose header misses a column it can
+            // offer is translated once more with it pushed down. Key columns are re-identified so a key bound as a
+            // null definition on one side never collides with a live attribute on the other.
+            Header declared = Header.fromAttributes(op.output());
+            Header lhsOffer = lhs.header().expand();
+            Header rhsOffer = rhs.header().expand();
+            Header named = labelsHeader(op.match().filterLabels());
+            Header keys = (switch (op.match().condition()) {
+                case NONE -> lhsOffer.minus(lhsOffer.missing(rhsOffer));
+                case ON -> named.bind(lhsOffer.plus(rhsOffer), false);
+                case IGNORING -> lhsOffer.minus(lhsOffer.missing(rhsOffer)).minus(named);
+            }).transformExpressions((column, grouping) -> new NamedColumn(column.attribute().withId(new NameId())));
+            lhs = retried(lhs, headerToPushDown, keys.plus(declared).bind(lhsOffer, false), left);
+            rhs = retried(rhs, headerToPushDown, keys.plus(declared).bind(rhsOffer, false), right);
 
-        /** Every label the source carries. */
-        private List<Attribute> sourceDimensions() {
-            return cmd.child()
-                .output()
-                .stream()
-                .filter(attribute -> attribute instanceof FieldAttribute field && field.isDimension())
-                .filter(attribute -> attribute instanceof TimeSeriesMetadataAttribute == false)
-                .toList();
-        }
+            // bind: the operands' carried headers are the final surfaces; link the negotiated columns to them. The
+            // build side is re-identified first so the join inputs share no attribute ids (both stack on the same
+            // source relation). Every key comes from an operand's offer, so after the retry at least one side names
+            // it; a key the other side lacks binds to a null definition there. The output binds the declared surface
+            // plus the surrounding demand the same way.
+            boolean rightJoining = op.match().joining() == Joining.RIGHT;
+            IntermediateResult probe = rightJoining ? rhs : lhs;
+            IntermediateResult build = reidentified(rightJoining ? lhs : rhs);
+            assert keys.missing(probe.header()).missing(build.header()).isDefined() == false
+                : "invariant: negotiated keys [" + keys + "] not covered by either operand";
+            Header probeKeys = keys.bind(probe.header(), true);
+            Header buildKeys = keys.bind(build.header(), true);
+            Header surface = outputSurface(op.match(), probe.header(), build.header());
+            Header output = declared.plus(headerToPushDown).bind(surface, true);
 
-        /** The join combinator over two independently compiled operand tables. */
-        private IntermediateResult doJoin(IntermediateResult lhs, IntermediateResult rhs, VectorBinaryOperator binaryOp) {
-            var match = binaryOp.match() != null
-                ? binaryOp.match()
-                : new VectorMatch(VectorMatch.Filter.NONE, Set.of(), VectorMatch.Joining.NONE, Set.of());
-            IntermediateResult probe = match.grouping() == VectorMatch.Joining.RIGHT ? rhs : lhs;
-            IntermediateResult build = match.grouping() == VectorMatch.Joining.RIGHT ? lhs : rhs;
-            LogicalPlan probePlan = probe.plan();
-            LogicalPlan buildPlan = build.plan();
-
-            List<String> keyNames = matchKeyNames(match, declaredLabels(binaryOp), sourceDimensions());
-            Attribute probeStep = findByName(probePlan.output(), cmd.stepColumnName());
-            Attribute buildStep = findByName(buildPlan.output(), cmd.stepColumnName());
-            List<Attribute> probeFields = new ArrayList<>(List.of(probeStep));
-            List<Attribute> buildFields = new ArrayList<>(List.of(buildStep));
-            List<Alias> absentLabels = new ArrayList<>();
-            List<Alias> probeFillers = new ArrayList<>();
-            List<Alias> buildFillers = new ArrayList<>();
-            for (MatchKey key : matchKeys(keyNames, probe.header(), build.header())) {
-                if (key.absent()) {
-                    // A label absent from both sides matches trivially (empty on each); on(...) still reports it.
-                    if (match.filter() == VectorMatch.Filter.ON) {
-                        absentLabels.add(new Alias(cmd.source(), key.label(), new Literal(cmd.source(), null, DataType.KEYWORD)));
-                    }
-                    continue;
-                }
-                // A label only one side carries matches only the other side's absent rows: null-fill that side.
-                probeFields.add(key.probe() != null ? key.probe() : nullKey(key.label(), key.build().dataType(), probeFillers));
-                buildFields.add(key.build() != null ? key.build() : nullKey(key.label(), key.probe().dataType(), buildFillers));
-            }
-            if (probeFillers.isEmpty() == false) {
-                probePlan = new Eval(cmd.source(), probePlan, probeFillers);
-            }
-            if (buildFillers.isEmpty() == false) {
-                buildPlan = new Eval(cmd.source(), buildPlan, buildFillers);
-            }
-
-            // A dimension can be multivalued, which the lookup table cannot key on. Pack each side's label keys into
-            // one single-valued column and join on [step, pack]: pack equality compares each match label as a whole
-            // value. Unlike the series identity (`_timeseries`, which also carries `__name__`), the pack covers
-            // exactly the labels the match keys on, so it can match across metrics.
-            Attribute probePack = null;
-            if (probeFields.size() > 1) {
-                probePack = PackDims.newPackedAttribute(cmd.source());
+            // emit: materialize the key definitions, pack the keys into one single-valued column per side, join on
+            // [step, pack], and compute the operator's value over the joined rows.
+            LogicalPlan probePlan = emitHeaderDefinitions(probe.plan(), probeKeys);
+            LogicalPlan buildPlan = emitHeaderDefinitions(build.plan(), buildKeys);
+            Attribute probeStep = findByName(probe.plan().output(), cmd.stepColumnName());
+            Attribute buildStep = findByName(build.plan().output(), cmd.stepColumnName());
+            List<Attribute> probeFields = List.of(probeStep);
+            List<Attribute> buildFields = List.of(buildStep);
+            if (probeKeys.isDefined()) {
+                Attribute probePack = PackDims.newPackedAttribute(cmd.source());
                 Attribute buildPack = PackDims.newPackedAttribute(cmd.source());
-                probePlan = new PackDims(cmd.source(), probePlan, List.copyOf(probeFields.subList(1, probeFields.size())), probePack);
-                buildPlan = new PackDims(cmd.source(), buildPlan, List.copyOf(buildFields.subList(1, buildFields.size())), buildPack);
-                probeFields = new ArrayList<>(List.of(probeStep, probePack));
-                buildFields = new ArrayList<>(List.of(buildStep, buildPack));
+                probePlan = new PackDims(cmd.source(), probePlan, probeKeys.labels(), probePack);
+                buildPlan = new PackDims(cmd.source(), buildPlan, buildKeys.labels(), buildPack);
+                probeFields = List.of(probeStep, probePack);
+                buildFields = List.of(buildStep, buildPack);
             }
-
-            LogicalPlan buildSide = buildPlan;
             List<Attribute> added = List.of();
-            List<Attribute> shadowed = new ArrayList<>();
-            boolean semiJoin = binaryOp instanceof VectorBinarySet;
-            if (semiJoin) {
-                // A semi-join keeps probe rows with a matching build key: dedup the build side and copy nothing.
-                var keys = new ArrayList<NamedExpression>(buildFields);
-                buildSide = new Aggregate(buildPlan.source(), buildPlan, new ArrayList<>(keys), keys);
+            if (op instanceof VectorBinarySet) {
+                List<NamedExpression> dedupKeys = List.copyOf(buildFields);
+                buildPlan = new Aggregate(buildPlan.source(), buildPlan, new ArrayList<>(dedupKeys), dedupKeys);
             } else {
-                // The columns the join copies from the build side onto every matched probe row: its value, plus the
-                // labels a group modifier names. A copied label shadows the probe's own column of that name.
-                List<Attribute> copied = new ArrayList<>(List.of(build.valueColumn()));
-                for (String label : match.groupingLabels()) {
-                    if (keyNames.contains(label)) {
-                        continue;
-                    }
-                    Attribute fromBuild = build.header().column(label);
-                    Attribute own = probe.header().column(label);
-                    if (fromBuild != null) {
-                        copied.add(fromBuild);
-                        if (own != null) {
-                            shadowed.add(own);
-                        }
-                    } else if (own == null) {
-                        absentLabels.add(new Alias(cmd.source(), label, new Literal(cmd.source(), null, DataType.KEYWORD)));
-                    }
-                }
-                // InnerJoin exposes the copied columns in build-output order and the physical plan assigns their
-                // channels in the order of this list, so the two must agree.
-                added = buildPlan.output().stream().filter(attr -> contains(copied, attr)).toList();
+                added = buildPlan.output()
+                    .stream()
+                    .filter(attr -> attr.semanticEquals(build.valueColumn()) || contains(surface.labels(), attr))
+                    .toList();
             }
-            boolean oneToOne = semiJoin == false && match.grouping() == VectorMatch.Joining.NONE;
-            LogicalPlan join = new InnerJoin(cmd.source(), probePlan, buildSide, probeFields, buildFields, added, oneToOne);
-
-            Expression lhsExpr = new ToDouble(lhs.value().source(), lhs.value());
-            Expression rhsExpr = new ToDouble(rhs.value().source(), rhs.value());
-            Expression result = lhsExpr;
+            boolean oneToOne = op instanceof VectorBinarySet == false && op.match().joining() == Joining.NONE;
+            LogicalPlan join = new InnerJoin(cmd.source(), probePlan, buildPlan, probeFields, buildFields, added, oneToOne);
+            Expression leftValue = rightJoining ? build.value() : probe.value();
+            Expression rightValue = rightJoining ? probe.value() : build.value();
+            Expression lhsExpr = new ToDouble(leftValue.source(), leftValue);
+            Expression rhsExpr = new ToDouble(rightValue.source(), rightValue);
+            Expression result = op instanceof VectorBinarySet
+                ? lhsExpr
+                : op.binaryOp().asFunction().create(op.source(), lhsExpr, rhsExpr, configuration());
             Expression filter = null;
-            switch (binaryOp) {
-                case VectorBinarySet ignored -> {
-                }
-                case VectorBinaryComparison comparison -> {
-                    Expression compare = comparison.op().asFunction().create(binaryOp.source(), lhsExpr, rhsExpr, configuration());
-                    if (comparison.filterMode()) {
-                        filter = compare;
-                    } else {
-                        result = new ToDouble(compare.source(), compare);
-                    }
-                }
-                case VectorBinaryArithmetic arith -> result = arith.op()
-                    .asFunction()
-                    .create(binaryOp.source(), lhsExpr, rhsExpr, configuration());
+            if (op instanceof VectorBinaryComparison comparison) {
+                filter = comparison.filterMode() ? result : null;
+                result = comparison.filterMode() ? lhsExpr : new ToDouble(result.source(), result);
             }
-
             Alias stepAlias = new Alias(probeStep.source(), probeStep.name(), probeStep, cmd.stepId());
-            Alias valueAlias = new Alias(binaryOp.source(), cmd.valueColumnName(), result, new NameId());
-            List<Alias> evalFields = new ArrayList<>(List.of(valueAlias, stepAlias));
-            evalFields.addAll(absentLabels);
-            LogicalPlan plan = new Eval(cmd.source(), join, evalFields);
+            Alias valueAlias = new Alias(op.source(), cmd.valueColumnName(), result, new NameId());
+            LogicalPlan plan = emitHeaderDefinitions(new Eval(cmd.source(), join, List.of(valueAlias, stepAlias)), output);
             if (filter != null) {
-                plan = new Filter(binaryOp.source(), plan, filter);
+                plan = new Filter(op.source(), plan, filter);
             }
-
-            List<Attribute> projected = new ArrayList<>(List.of(valueAlias.toAttribute(), stepAlias.toAttribute()));
-            absentLabels.forEach(a -> projected.add(a.toAttribute()));
-            // Everything the join emits except the operands' own plumbing: both value columns, the raw probe step
-            // (re-aliased above) and the probe labels a group modifier copy shadows. What of it reaches the response
-            // is decided by the operator's declared output, enforced by the command's final projection.
-            List<Attribute> plumbing = new ArrayList<>(List.of(probe.valueColumn(), build.valueColumn(), probeStep));
-            plumbing.addAll(shadowed);
-            if (probePack != null) {
-                plumbing.add(probePack);
-            }
-            for (Attribute attr : join.output()) {
-                if (contains(plumbing, attr) == false) {
-                    projected.add(attr);
-                }
-            }
+            List<NamedExpression> projected = new ArrayList<>(List.of(valueAlias.toAttribute(), stepAlias.toAttribute()));
+            projected.addAll(output.exposedExpressions());
             plan = new Project(cmd.source(), plan, projected);
 
-            Header joinedHeader = hasVectorMatch(binaryOp)
-                ? Header.fromAttributes(binaryOp.output(), Set.of())
-                : Header.fromAttributes(plan.output(), Set.of(cmd.valueColumnName(), cmd.stepColumnName()));
-            return new IntermediateResult(plan, valueAlias.toAttribute(), null, joinedHeader, Kind.AFTER_INITIAL_AGGREGATE);
-        }
-
-        /** A null-valued stand-in for a join key label an operand cannot produce: PromQL's "absent label is empty". */
-        private Attribute nullKey(String label, DataType type, List<Alias> fillers) {
-            Alias filler = new Alias(cmd.source(), label, new Literal(cmd.source(), null, type));
-            fillers.add(filler);
-            return filler.toAttribute();
+            // report: the output surface the parent composes against.
+            return new IntermediateResult(plan, valueAlias.toAttribute(), null, output, Kind.AFTER_INITIAL_AGGREGATE);
         }
 
         /**
-         * Translates one operand of a vector-matched binary operator with a sub-{@link Translation} against its own
-         * independent copy of the source, so the two join operands share no attribute ids by construction.
+         * Re-identifies a finished operand so it shares no attribute ids with the other join input (both stack on
+         * the same source relation). The value column is renamed in the same pass so it cannot collide by name with
+         * the other side's after the join.
          */
-        private IntermediateResult doTranslateJoinOperand(LogicalPlan operand) {
+        private IntermediateResult reidentified(IntermediateResult ir) {
             Map<NameId, NameId> ids = new HashMap<>();
-            LogicalPlan forkedChild = cmd.child().transformExpressionsDown(Expression.class, e -> reidExpr(e, ids));
-            LogicalPlan forkedFragment = operand.transformExpressionsDown(Expression.class, e -> reidExpr(e, ids));
-            Expression forkedTimestamp = cmd.timestamp() == null ? null : reidExpr(cmd.timestamp(), ids);
-            Header forkedDemand = mapHeaderAttributes(headerToPushDown, ids);
-            PromqlCommand fork = new PromqlCommand(
-                cmd.source(),
-                forkedChild,
-                forkedFragment,
-                cmd.start(),
-                cmd.end(),
-                cmd.step(),
-                cmd.buckets(),
-                cmd.scrapeInterval(),
-                TemporaryNameGenerator.locallyUniqueTemporaryName(cmd.valueColumnName()),
-                forkedTimestamp
-            );
-            return new Translation(fork, analyzer, null, forkedDemand, null).translateIntermediate(
-                fork.promqlPlan(),
-                fork.stepId(),
-                fork.valueId()
-            );
+            String valueName = TemporaryNameGenerator.locallyUniqueTemporaryName(cmd.valueColumnName());
+            LogicalPlan plan = ir.plan()
+                .transformExpressionsDown(Expression.class, e -> reidExpr(renamed(e, cmd.valueColumnName(), valueName), ids));
+            Expression value = reidExpr(renamed(ir.valueColumn(), cmd.valueColumnName(), valueName), ids);
+            Header header = mapHeaderAttributes(ir.header(), ids);
+            return new IntermediateResult(plan, value, ir.pendingFilter(), header, ir.kind);
         }
 
         /** Fold left and right aggregates into a single plan. */
@@ -942,12 +892,13 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             Expression expr = selector instanceof InstantSelector
                 ? new LastOverTime(selector.source(), selector.series(), AggregateFunction.NO_WINDOW, time)
                 : selector.series();
-            List<Attribute> dimensions = input.output()
-                .stream()
-                .filter(attribute -> attribute instanceof FieldAttribute field && field.isDimension())
-                .filter(attribute -> attribute instanceof TimeSeriesMetadataAttribute == false)
-                .toList();
-            return new IntermediateResult(input, expr, matcher, headerToPushDown.withIdentityGrouping().including(dimensions));
+            List<Attribute> dimensions = Header.dimensions(input.output());
+            return new IntermediateResult(
+                input,
+                expr,
+                matcher,
+                headerToPushDown.withIdentityGrouping().including(dimensions).withUniverse(dimensions)
+            );
         }
 
         /**
@@ -1014,24 +965,18 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             }
             NamedExpression value = new Alias(aggExpr.source(), cmd.valueColumnName(), aggExpr);
             List<Attribute> available = plan.output();
-
-            var nulls = new ArrayList<Alias>();
-            Header physicalHeader = header.transformExpressions((col, grouping) -> {
-                if (col instanceof TimeSeriesColumn tc) {
-                    var m = findById(tc.attribute(), available);
-                    return m != null ? new TimeSeriesColumn(m, tc.exclusions()) : null;
+            Header physicalHeader = header.transformExpressions((column, grouping) -> {
+                if (column instanceof TimeSeriesColumn timeSeries) {
+                    Attribute resolved = findById(timeSeries.attribute(), available);
+                    return resolved != null ? new TimeSeriesColumn(resolved, timeSeries.exclusions()) : null;
                 }
-                var m = findByIdOrName(col.attribute(), available);
-                if (m == null && grouping) {
-                    nulls.add(emitNullExpression(col.attribute()));
-                    return new NamedColumn(nulls.getLast());
+                Attribute resolved = findByIdOrName(column.attribute(), available);
+                if (resolved != null) {
+                    return new NamedColumn(resolved);
                 }
-                return m != null ? new NamedColumn(m) : null;
+                return grouping ? new NamedColumn(nullColumn(column.attribute())) : null;
             });
-
-            if (nulls.isEmpty() == false) {
-                plan = new Eval(source, plan, nulls);
-            }
+            plan = emitHeaderDefinitions(plan, physicalHeader);
 
             if (requiresPacking) {
                 // TranslateTimeSeriesAggregate unpacks the inner TSA's dimensions and this regroup re-packs them.
@@ -1071,6 +1016,11 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                 List<NamedExpression> keys = physicalHeader.exposedExpressions();
                 return new Aggregate(source, plan, groupings(step, keys), aggregates(value, step, keys));
             }
+        }
+
+        private LogicalPlan emitHeaderDefinitions(LogicalPlan plan, Header header) {
+            List<Alias> definitions = header.expressions().stream().filter(Alias.class::isInstance).map(Alias.class::cast).toList();
+            return definitions.isEmpty() ? plan : new Eval(cmd.source(), plan, definitions);
         }
 
         /** Projects the plan to the command's declared output, re-aliasing columns that match by name but not by id. */
@@ -1220,29 +1170,49 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         return attributes.stream().anyMatch(candidate::semanticEquals);
     }
 
-    /**
-     * Whether the operands have to be matched rather than folded. A scalar applies elementwise, and two identical
-     * operands - the same selector under the same grouping - describe one frame whose rows already line up, so the
-     * operator composes as an expression over it. Anything else is a pair of tables and needs a join.
-     */
-    private static boolean requiresMatching(VectorBinaryOperator op) {
-        if (isScalar(op.left()) || isScalar(op.right())) {
-            return false;
-        }
-        return op.left().equals(op.right()) == false;
-    }
-
     /** Whether the operator declares explicit vector matching (on/ignoring, group_left/right). */
     private static boolean hasVectorMatch(VectorBinaryOperator op) {
         VectorMatch match = op.match();
-        return match != null && (match.filter() != VectorMatch.Filter.NONE || match.grouping() != VectorMatch.Joining.NONE);
+        return match.condition() != Condition.NONE || match.joining() != Joining.NONE;
+    }
+
+    /**
+     * The result surface of a join: the probe side's header, with group-modifier labels sourced from the build side.
+     * A declared probe grouping is shadowed by the modifier (null when the build side cannot supply the label), but
+     * an opaque probe keeps its identity's labels - a modifier cannot strip a label out of a packed series identity.
+     */
+    private static Header outputSurface(VectorMatch match, Header probe, Header build) {
+        if (match.joining() == Joining.NONE) {
+            return probe;
+        }
+        Header modifiers = labelsHeader(match.groupingLabels());
+        Header copied = modifiers.bind(build, false);
+        Header shadowed = probe.hasTimeSeriesGrouping() ? copied : modifiers;
+        return probe.minus(shadowed).plus(copied);
+    }
+
+    private static Header labelsHeader(Set<String> names) {
+        return Header.undefined()
+            .including(names.stream().<Attribute>map(name -> new ReferenceAttribute(Source.EMPTY, name, DataType.KEYWORD)).toList());
+    }
+
+    /** Renames an attribute or alias in a re-identification pass; other expressions pass through unchanged. */
+    private static Expression renamed(Expression e, String from, String to) {
+        if (e instanceof Attribute a && a.name().equals(from)) {
+            return a.withName(to);
+        }
+        if (e instanceof Alias a && a.name().equals(from)) {
+            return new Alias(a.source(), to, a.child(), a.id());
+        }
+        return e;
     }
 
     private static Header mapHeaderAttributes(Header header, Map<NameId, NameId> ids) {
         return header.transformExpressions((column, grouping) -> {
             if (column instanceof TimeSeriesColumn tc) {
                 List<Attribute> exclusions = tc.exclusions().stream().map(a -> (Attribute) reidExpr(a, ids)).toList();
-                return new TimeSeriesColumn((NamedExpression) reidExpr(tc.attribute(), ids), exclusions);
+                List<Attribute> labels = tc.labels().stream().map(a -> (Attribute) reidExpr(a, ids)).toList();
+                return new TimeSeriesColumn((NamedExpression) reidExpr(tc.attribute(), ids), exclusions, labels);
             }
             return new NamedColumn((NamedExpression) reidExpr(column.attribute(), ids));
         });
@@ -1261,7 +1231,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
 
     /** Flattens a left-associative top-level {@code or} chain into branches; branch 0 has the highest precedence. */
     private static void flattenUnion(LogicalPlan node, List<LogicalPlan> branches) {
-        if (node instanceof VectorBinarySet setOp && setOp.op() == VectorBinarySet.SetOp.UNION) {
+        if (node instanceof VectorBinarySet setOp && setOp.op() == UNION) {
             flattenUnion(setOp.left(), branches);
             flattenUnion(setOp.right(), branches);
         } else {
@@ -1282,11 +1252,6 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         aggregates.add(step);
         aggregates.addAll(keys);
         return aggregates;
-    }
-
-    private static Alias emitNullExpression(Attribute attribute) {
-        var nullLiteral = new Literal(attribute.source(), null, attribute.resolved() ? attribute.dataType() : DataType.KEYWORD);
-        return new Alias(attribute.source(), attribute.name(), nullLiteral, attribute.id());
     }
 
     /** The first output attribute is always the value column. */

@@ -7,16 +7,18 @@
 
 package org.elasticsearch.xpack.esql.optimizer.rules.logical.promql;
 
+import org.elasticsearch.xpack.esql.core.expression.Alias;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
+import org.elasticsearch.xpack.esql.core.expression.Literal;
 import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
+import org.elasticsearch.xpack.esql.core.expression.TimeSeriesMetadataAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.plan.logical.promql.AcrossSeriesAggregate;
-import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch;
 
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -46,10 +48,20 @@ public final class PromqlAttributesTranslationContext {
     /** A named column. */
     public record NamedColumn(NamedExpression expression) implements Column {}
 
-    /** A time-series metadata block-loader column with its exclusion set (skip-set). */
-    public record TimeSeriesColumn(NamedExpression expression, List<Attribute> exclusions) implements Column {
+    /**
+     * A time-series metadata block-loader column with its exclusion set (skip-set). The identity stands for "every
+     * label of its source except the exclusions"; {@code labels} is that source universe, bound at the leaf where the
+     * symbolic identity meets a concrete relation ({@link Header#withUniverse}) and empty on demand columns, which
+     * only name an exclusion set.
+     */
+    public record TimeSeriesColumn(NamedExpression expression, List<Attribute> exclusions, List<Attribute> labels) implements Column {
         public TimeSeriesColumn {
             exclusions = distinctByCanonicalName(exclusions);
+            labels = distinctByCanonicalName(labels);
+        }
+
+        public TimeSeriesColumn(NamedExpression expression, List<Attribute> exclusions) {
+            this(expression, exclusions, List.of());
         }
 
         public static TimeSeriesColumn of(List<Attribute> exclusions) {
@@ -65,8 +77,8 @@ public final class PromqlAttributesTranslationContext {
     /**
      * The symbolic columns exposed by a translated subtree. The same type flows in both directions of the
      * negotiation: upward as the surface a subtree produced, and downward as the demand a parent pushes to a
-     * child - the columns the child must expose ({@link #success}) and, when non-empty, the concrete grouping the
-     * demand pins ({@code groupBy}). Translation may widen a demand and retry a child.
+     * child - the columns the child must expose ({@link #missing}) and, when non-empty, the concrete grouping the
+     * demand pins ({@code groupBy}). Translation may widen a demand ({@link #plus}) and retry a child.
      */
     public static final class Header {
         private final List<Column> groupBy;
@@ -84,15 +96,12 @@ public final class PromqlAttributesTranslationContext {
 
         /**
          * The header over the given attributes: their named labels plus, when present, the packed time-series
-         * identity. Attributes with an excluded name carry no label (a value or step column).
+         * identity.
          */
-        public static Header fromAttributes(List<Attribute> attributes, Set<String> excludedNames) {
+        public static Header fromAttributes(List<Attribute> attributes) {
             List<Attribute> labels = new ArrayList<>();
             TimeSeriesColumn timeSeries = null;
             for (Attribute attribute : attributes) {
-                if (excludedNames.contains(attribute.name())) {
-                    continue;
-                }
                 if (MetadataAttribute.isTimeSeriesAttributeName(attribute.name())) {
                     timeSeries = new TimeSeriesColumn(attribute, List.of());
                 } else {
@@ -101,6 +110,14 @@ public final class PromqlAttributesTranslationContext {
             }
             Header header = undefined().including(labels);
             return timeSeries != null ? header.including(timeSeries) : header;
+        }
+
+        /** The concrete dimension columns in a source relation. */
+        public static List<Attribute> dimensions(List<Attribute> attributes) {
+            return attributes.stream()
+                .filter(attribute -> attribute instanceof FieldAttribute field && field.isDimension())
+                .filter(attribute -> attribute instanceof TimeSeriesMetadataAttribute == false)
+                .toList();
         }
 
         /** Add named column requirements without changing the primary grouping. */
@@ -130,44 +147,83 @@ public final class PromqlAttributesTranslationContext {
         }
 
         /**
-         * Widen this demand with the identity requirement implied by a grouping header.
-         * <p>
-         * When this demand has no grouping yet, the required TA <em>is</em> the leaf identity (e.g. single
-         * {@code without(pod)} → {@code ta·skip{pod}}). Pinning it into {@code groupBy} stops
-         * {@link #withIdentityGrouping} from also inventing a full {@code ta·skip{}} and emitting two
-         * {@code _timeseries} columns. When a TA group key already exists, the required identity is only
-         * carried as an extra column (nested {@code without}).
+         * Union: this header's columns plus the other's. Adding an identity column to an ungrouped header pins it as
+         * the grouping: when a demand has no grouping yet, the required identity <em>is</em> the leaf identity (e.g. a
+         * single {@code without(pod)} → {@code ta·skip{pod}}), and pinning it stops {@link #withIdentityGrouping} from
+         * also inventing a full {@code ta·skip{}} and emitting two {@code _timeseries} columns.
          */
-        public Header requiring(Header grouping) {
-            TimeSeriesColumn tc = grouping.groupByTimeSeries();
-            if (tc == null) {
-                return this;
+        public Header plus(Header other) {
+            Header result = this;
+            for (Column column : other.columns) {
+                result = result.plus(column);
             }
-            TimeSeriesColumn required = TimeSeriesColumn.of(tc.exclusions());
-            if (groupByTimeSeries() != null) {
-                return including(required);
-            }
-            if (groupBy.isEmpty()) {
-                var exposed = new ArrayList<Column>(columns.size() + 1);
-                exposed.add(required);
-                for (Column column : columns) {
-                    if (eq(column, required) == false) {
-                        exposed.add(column);
-                    }
-                }
-                return new Header(List.of(required), exposed);
-            }
-            return including(required);
+            return result;
         }
 
-        /** Whether a returned header exposes every time-series identity this demand requires. */
-        public boolean success(Header header) {
+        private Header plus(Column column) {
+            if (column instanceof TimeSeriesColumn && groupBy.isEmpty()) {
+                var exposed = new ArrayList<Column>(columns.size() + 1);
+                exposed.add(column);
+                for (Column existing : columns) {
+                    if (eq(existing, column) == false) {
+                        exposed.add(existing);
+                    }
+                }
+                return new Header(List.of(column), exposed);
+            }
+            if (contains(columns, column)) {
+                return this;
+            }
+            var exposed = new ArrayList<>(columns);
+            exposed.add(column);
+            return new Header(groupBy, exposed);
+        }
+
+        /** Difference: this header without the other's columns. */
+        public Header minus(Header other) {
+            return transformExpressions((column, grouping) -> contains(other.columns, column) ? null : column);
+        }
+
+        /**
+         * The columns of this required header that the actual header does not cover - the compatibility check of the
+         * translation protocol. Identity requirements come back re-identified so they can be pushed down as a demand
+         * into a fresh subtree.
+         */
+        public Header missing(Header actual) {
+            var uncovered = new ArrayList<Column>();
             for (Column column : columns) {
-                if (column instanceof TimeSeriesColumn tc && header.timeSeries(tc.exclusions()) == null) {
-                    return false;
+                if (column instanceof TimeSeriesColumn tc) {
+                    if (actual.timeSeries(tc.exclusions()) == null) {
+                        uncovered.add(TimeSeriesColumn.of(tc.exclusions()));
+                    }
+                } else if (actual.column(toCanonicalName(column.attribute())) == null) {
+                    uncovered.add(column);
                 }
             }
-            return true;
+            return new Header(List.of(), uncovered);
+        }
+
+        /** Replaces opaque identity columns with the source labels they stand for (every label of their universe not excluded). */
+        public Header expand() {
+            Header result = undefined().including(labels());
+            for (Column column : columns) {
+                if (column instanceof TimeSeriesColumn timeSeries) {
+                    Set<String> excluded = toCanonicalNames(timeSeries.exclusions());
+                    result = result.including(
+                        timeSeries.labels().stream().filter(label -> excluded.contains(toCanonicalName(label)) == false).toList()
+                    );
+                }
+            }
+            return result;
+        }
+
+        /** Binds every identity column to the label universe it ranges over - the source dimensions of a leaf. */
+        public Header withUniverse(List<Attribute> universe) {
+            return transformExpressions(
+                (column, grouping) -> column instanceof TimeSeriesColumn timeSeries
+                    ? new TimeSeriesColumn(timeSeries.expression(), timeSeries.exclusions(), universe)
+                    : column
+            );
         }
 
         /** The named columns of this header; on a demand, the labels a parent requires. */
@@ -210,7 +266,11 @@ public final class PromqlAttributesTranslationContext {
             List<Attribute> removed = distinctByCanonicalName(labels);
             TimeSeriesColumn timeSeries = groupByTimeSeries();
             if (timeSeries != null) {
-                TimeSeriesColumn desired = TimeSeriesColumn.of(PromqlAttributesTranslationContext.union(timeSeries.exclusions(), removed));
+                TimeSeriesColumn desired = new TimeSeriesColumn(
+                    FieldAttribute.timeSeriesAttribute(Source.EMPTY),
+                    PromqlAttributesTranslationContext.union(timeSeries.exclusions(), removed),
+                    timeSeries.labels()
+                );
                 TimeSeriesColumn exposed = timeSeries(desired.exclusions());
                 desired = exposed == null ? desired : exposed;
                 return new Header(List.of(desired), List.of(desired));
@@ -319,6 +379,17 @@ public final class PromqlAttributesTranslationContext {
             return columns.stream().anyMatch(TimeSeriesColumn.class::isInstance);
         }
 
+        /** Binds this logical header to another header's columns, optionally defining absent named columns as null. */
+        public Header bind(Header available, boolean nullMissing) {
+            return transformExpressions((column, grouping) -> {
+                Column resolved = available.columns.stream().filter(candidate -> eq(column, candidate)).findFirst().orElse(null);
+                if (resolved != null) {
+                    return resolved;
+                }
+                return nullMissing && column instanceof NamedColumn ? new NamedColumn(nullColumn(column.attribute())) : null;
+            });
+        }
+
         private static List<Column> transform(List<Column> source, List<Column> originals, List<Column> transformed) {
             var result = new ArrayList<Column>(source.size());
             for (Column column : source) {
@@ -336,69 +407,11 @@ public final class PromqlAttributesTranslationContext {
         }
     }
 
-    /** A vector-match join key: one matched label and the column each operand exposes for it, either possibly null. */
-    public record MatchKey(String label, Attribute probe, Attribute build) {
-        public boolean absent() {
-            return probe == null && build == null;
-        }
-    }
-
-    /**
-     * The label names a vector match keys on. {@code on(...)} names them (even ones the universe does not know, which
-     * stay absent on both sides); {@code ignoring(...)} keys on the labels the operands declare minus the ignored ones
-     * - an opaque operand declares none, so its packed identity is never a key; matching with neither keys on every
-     * label of the universe.
-     */
-    public static List<String> matchKeyNames(VectorMatch match, List<Attribute> declared, List<Attribute> universe) {
-        if (match != null && match.filter() == VectorMatch.Filter.ON) {
-            return List.copyOf(match.filterLabels());
-        }
-        List<Attribute> keyed = match != null && match.filter() == VectorMatch.Filter.IGNORING ? declared : universe;
-        Set<String> ignored = match != null ? match.filterLabels() : Set.of();
-        return keyed.stream()
-            .map(PromqlAttributesTranslationContext::toCanonicalName)
-            .filter(name -> MetadataAttribute.isTimeSeriesAttributeName(name) == false && ignored.contains(name) == false)
-            .distinct()
-            .toList();
-    }
-
-    /**
-     * The labels a match demands its operands expose as columns: the ones it keys on, widened to the whole universe
-     * when a group modifier keeps the many side's full label set on the result.
-     */
-    public static List<Attribute> matchDemand(VectorMatch match, List<Attribute> declared, List<Attribute> universe) {
-        if (match == null || match.grouping() != VectorMatch.Joining.NONE) {
-            return universe;
-        }
-        return resolveLabels(matchKeyNames(match, declared, universe), universe);
-    }
-
-    /** The universe attributes backing the given label names; names the universe does not know are left out. */
-    public static List<Attribute> resolveLabels(Collection<String> names, List<Attribute> universe) {
-        List<Attribute> labels = new ArrayList<>(names.size());
-        for (String name : names) {
-            Attribute label = findByName(universe, name);
-            if (label != null) {
-                labels.add(label);
-            }
-        }
-        return labels;
-    }
-
-    /** Pairs every matched label with the columns the two operand headers expose for it. */
-    public static List<MatchKey> matchKeys(Collection<String> names, Header probe, Header build) {
-        List<MatchKey> keys = new ArrayList<>(names.size());
-        for (String name : names) {
-            keys.add(new MatchKey(name, probe.column(name), build.column(name)));
-        }
-        return keys;
-    }
-
     /** Links a column to the matching attribute of a plan output; keeps the column unchanged when there is none. */
     static Column resolveColumn(Column column, List<Attribute> available) {
         if (column instanceof TimeSeriesColumn tc) {
             var m = findById(tc.attribute(), available);
-            return m != null ? new TimeSeriesColumn(m, tc.exclusions()) : column;
+            return m != null ? new TimeSeriesColumn(m, tc.exclusions(), tc.labels()) : column;
         }
         var m = findByIdOrName(column.attribute(), available);
         return m != null ? new NamedColumn(m) : column;
@@ -458,6 +471,12 @@ public final class PromqlAttributesTranslationContext {
         var names = new LinkedHashSet<String>();
         attributes.forEach(attribute -> names.add(toCanonicalName(attribute)));
         return names;
+    }
+
+    /** A definition of the attribute's column as null - the physical form of a required column nobody produces. */
+    static Alias nullColumn(Attribute attribute) {
+        var literal = new Literal(attribute.source(), null, attribute.resolved() ? attribute.dataType() : DataType.KEYWORD);
+        return new Alias(attribute.source(), attribute.name(), literal, attribute.id());
     }
 
     static String toCanonicalName(Attribute attribute) {

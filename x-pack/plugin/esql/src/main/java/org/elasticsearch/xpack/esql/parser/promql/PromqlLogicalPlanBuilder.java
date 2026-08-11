@@ -449,7 +449,7 @@ public class PromqlLogicalPlanBuilder extends PromqlExpressionBuilder {
 
         PromqlBaseParser.ModifierContext modifierCtx = ctx.modifier();
         if (modifierCtx != null) {
-            VectorMatch.Filter filter = modifierCtx.ON() != null ? VectorMatch.Filter.ON : VectorMatch.Filter.IGNORING;
+            VectorMatch.Condition condition = modifierCtx.ON() != null ? VectorMatch.Condition.ON : VectorMatch.Condition.IGNORING;
             List<String> filterList = visitLabelList(modifierCtx.modifierLabels);
             VectorMatch.Joining joining = VectorMatch.Joining.NONE;
             List<String> groupingList = visitLabelList(modifierCtx.groupLabels);
@@ -479,7 +479,7 @@ public class PromqlLogicalPlanBuilder extends PromqlExpressionBuilder {
                 }
             }
 
-            modifier = new VectorMatch(filter, new LinkedHashSet<>(filterList), joining, new LinkedHashSet<>(groupingList));
+            modifier = new VectorMatch(condition, new LinkedHashSet<>(filterList), joining, new LinkedHashSet<>(groupingList));
         }
 
         return switch (binaryOperator) {

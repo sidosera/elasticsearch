@@ -439,22 +439,22 @@ public class PromqlParserTests extends ESTestCase {
         var promql = parse("PROMQL index=test step=5m foo > Bool On(job) bar");
         VectorBinaryComparison binaryComp = as(promql.promqlPlan(), VectorBinaryComparison.class);
         assertThat(binaryComp.boolMode(), equalTo(true));
-        assertThat(binaryComp.match().filter(), equalTo(VectorMatch.Filter.ON));
+        assertThat(binaryComp.match().condition(), equalTo(VectorMatch.Condition.ON));
 
         promql = parse("PROMQL index=test step=5m foo < IGNORING (job) bar");
         binaryComp = as(promql.promqlPlan(), VectorBinaryComparison.class);
         assertThat(binaryComp.boolMode(), equalTo(false));
-        assertThat(binaryComp.match().filter(), equalTo(VectorMatch.Filter.IGNORING));
+        assertThat(binaryComp.match().condition(), equalTo(VectorMatch.Condition.IGNORING));
 
         promql = parse("PROMQL index=test step=5m foo / ON (job) GROUP_LEFT bar");
         VectorBinaryArithmetic binaryArith = as(promql.promqlPlan(), VectorBinaryArithmetic.class);
-        assertThat(binaryArith.match().grouping(), equalTo(VectorMatch.Joining.LEFT));
-        assertThat(binaryArith.match().filter(), equalTo(VectorMatch.Filter.ON));
+        assertThat(binaryArith.match().joining(), equalTo(VectorMatch.Joining.LEFT));
+        assertThat(binaryArith.match().condition(), equalTo(VectorMatch.Condition.ON));
 
         promql = parse("PROMQL index=test step=5m foo / ON (job) GROUP_RIGHT bar");
         binaryArith = as(promql.promqlPlan(), VectorBinaryArithmetic.class);
-        assertThat(binaryArith.match().grouping(), equalTo(VectorMatch.Joining.RIGHT));
-        assertThat(binaryArith.match().filter(), equalTo(VectorMatch.Filter.ON));
+        assertThat(binaryArith.match().joining(), equalTo(VectorMatch.Joining.RIGHT));
+        assertThat(binaryArith.match().condition(), equalTo(VectorMatch.Condition.ON));
     }
 
     public void testCaseInsensitivityModifier() {
@@ -700,9 +700,9 @@ public class PromqlParserTests extends ESTestCase {
             PromqlCommand.class
         );
         VectorMatch match = as(promql.promqlPlan(), VectorBinaryArithmetic.class).match();
-        assertThat(match.filter(), equalTo(VectorMatch.Filter.ON));
+        assertThat(match.condition(), equalTo(VectorMatch.Condition.ON));
         assertThat(match.filterLabels(), equalTo(Set.of("cluster", "job")));
-        assertThat(match.grouping(), equalTo(VectorMatch.Joining.LEFT));
+        assertThat(match.joining(), equalTo(VectorMatch.Joining.LEFT));
         assertThat(match.groupingLabels(), equalTo(Set.of("pod")));
     }
 
@@ -715,9 +715,9 @@ public class PromqlParserTests extends ESTestCase {
             PromqlCommand.class
         );
         VectorMatch match = as(promql.promqlPlan(), VectorBinaryArithmetic.class).match();
-        assertThat(match.filter(), equalTo(VectorMatch.Filter.IGNORING));
+        assertThat(match.condition(), equalTo(VectorMatch.Condition.IGNORING));
         assertThat(match.filterLabels(), equalTo(Set.of("instance")));
-        assertThat(match.grouping(), equalTo(VectorMatch.Joining.RIGHT));
+        assertThat(match.joining(), equalTo(VectorMatch.Joining.RIGHT));
         assertThat(match.groupingLabels(), equalTo(Set.of("zone")));
     }
 

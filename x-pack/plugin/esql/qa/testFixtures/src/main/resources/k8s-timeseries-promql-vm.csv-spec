@@ -902,3 +902,179 @@ r:double | cluster:keyword | pod:keyword | step:datetime
 361.0    | prod            | three       | 2024-05-10T00:10:00.000Z
 298.0    | prod            | two         | 2024-05-10T00:10:00.000Z
 ;
+
+///////////////////////////////////////////////////////////////////////////////
+// Nested vector matches: a matched binary operator as an operand of another
+// operator (another match, an aggregation, a function, a set operator). The
+// join's output header must compose like any other subtree: its labels feed the
+// parent's keys and demand pushes down through it.
+///////////////////////////////////////////////////////////////////////////////
+
+// The LHS of the outer on(cluster) match is itself an on(cluster) match:
+// result = (tx - rx) / rx per (cluster, step).
+vector_match_nested_join_operand
+required_capability: promql_command_v0
+required_capability: promql_vector_matching_v0
+PROMQL index=k8s step=10m result=((sum by (cluster) (network.eth0.tx) - on (cluster) sum by (cluster) (network.eth0.rx)) / on (cluster) sum by (cluster) (network.eth0.rx))
+| SORT cluster, step;
+
+result:double         | step:datetime            | cluster:keyword
+0.10330578512396695   | 2024-05-10T00:10:00.000Z | prod
+0.14115138592750534   | 2024-05-10T00:20:00.000Z | prod
+0.16072408118486012   | 2024-05-10T00:30:00.000Z | prod
+-0.026944585663446874 | 2024-05-10T00:10:00.000Z | qa
+0.21941918451158698   | 2024-05-10T00:20:00.000Z | qa
+0.19050233324183366   | 2024-05-10T00:30:00.000Z | qa
+-0.06568265682656826  | 2024-05-10T00:10:00.000Z | staging
+0.04268545379196022   | 2024-05-10T00:20:00.000Z | staging
+-0.00967741935483871  | 2024-05-10T00:30:00.000Z | staging
+;
+
+// Both operands of the outer match are themselves matches:
+// result = (tx + rx) / (tx - rx) per (cluster, step).
+vector_match_nested_join_both_operands
+required_capability: promql_command_v0
+required_capability: promql_vector_matching_v0
+PROMQL index=k8s step=10m result=((sum by (cluster) (network.eth0.tx) + on (cluster) sum by (cluster) (network.eth0.rx)) / on (cluster) (sum by (cluster) (network.eth0.tx) - on (cluster) sum by (cluster) (network.eth0.rx)))
+| SORT cluster, step;
+
+result:double       | step:datetime            | cluster:keyword
+20.36               | 2024-05-10T00:10:00.000Z | prod
+15.169184290030211  | 2024-05-10T00:20:00.000Z | prod
+13.443686006825939  | 2024-05-10T00:30:00.000Z | prod
+-73.22641509433963  | 2024-05-10T00:10:00.000Z | qa
+10.114973262032086  | 2024-05-10T00:20:00.000Z | qa
+11.498559077809798  | 2024-05-10T00:30:00.000Z | qa
+-29.44943820224719  | 2024-05-10T00:10:00.000Z | staging
+47.85436893203884   | 2024-05-10T00:20:00.000Z | staging
+-205.66666666666666 | 2024-05-10T00:30:00.000Z | staging
+;
+
+// The RHS of the outer match is itself a match: result = tx / (tx + rx) per
+// (cluster, step).
+vector_match_nested_join_rhs_operand
+required_capability: promql_command_v0
+required_capability: promql_vector_matching_v0
+PROMQL index=k8s step=10m result=(sum by (cluster) (network.eth0.tx) / on (cluster) (sum by (cluster) (network.eth0.tx) + on (cluster) sum by (cluster) (network.eth0.rx)))
+| SORT cluster, step;
+
+result:double       | step:datetime            | cluster:keyword
+0.5245579567779961  | 2024-05-10T00:10:00.000Z | prod
+0.5329615614419438  | 2024-05-10T00:20:00.000Z | prod
+0.5371921807565372  | 2024-05-10T00:30:00.000Z | prod
+0.49317186292192733 | 2024-05-10T00:10:00.000Z | qa
+0.5494316679883691  | 2024-05-10T00:20:00.000Z | qa
+0.5434837092731829  | 2024-05-10T00:30:00.000Z | qa
+0.4830217474246471  | 2024-05-10T00:10:00.000Z | staging
+0.5104483668086833  | 2024-05-10T00:20:00.000Z | staging
+0.49756888168557534 | 2024-05-10T00:30:00.000Z | staging
+;
+
+// Different keys per nesting level: the inner match is per (cluster, pod), the
+// outer group_left broadcasts a per-cluster vector over the inner result's pods.
+// result = (tx_pod / rx_pod) * rx_cluster.
+vector_match_nested_join_mixed_keys
+required_capability: promql_command_v0
+required_capability: promql_vector_matching_v0
+PROMQL index=k8s step=10m r=((sum by (cluster, pod) (network.eth0.tx) / on (cluster, pod) sum by (cluster, pod) (network.eth0.rx)) * on (cluster) group_left sum by (cluster) (network.eth0.rx))
+| WHERE cluster == "prod" AND step == "2024-05-10T00:10:00.000Z"
+| KEEP r, cluster, pod, step
+| SORT pod;
+
+r:double           | cluster:keyword | pod:keyword | step:datetime
+899.8000000000001  | prod            | one         | 2024-05-10T00:10:00.000Z
+947.0135501355013  | prod            | three       | 2024-05-10T00:10:00.000Z
+1814.2389937106918 | prod            | two         | 2024-05-10T00:10:00.000Z
+;
+
+// A bool comparison between two nested matches: tx/rx > rx/tx iff tx > rx.
+vector_match_nested_join_comparison
+required_capability: promql_command_v0
+required_capability: promql_vector_matching_v0
+PROMQL index=k8s step=10m result=((sum by (cluster) (network.eth0.tx) / on (cluster) sum by (cluster) (network.eth0.rx)) > bool on (cluster) (sum by (cluster) (network.eth0.rx) / on (cluster) sum by (cluster) (network.eth0.tx)))
+| SORT cluster, step;
+
+result:double | step:datetime            | cluster:keyword
+1.0           | 2024-05-10T00:10:00.000Z | prod
+1.0           | 2024-05-10T00:20:00.000Z | prod
+1.0           | 2024-05-10T00:30:00.000Z | prod
+0.0           | 2024-05-10T00:10:00.000Z | qa
+1.0           | 2024-05-10T00:20:00.000Z | qa
+1.0           | 2024-05-10T00:30:00.000Z | qa
+0.0           | 2024-05-10T00:10:00.000Z | staging
+1.0           | 2024-05-10T00:20:00.000Z | staging
+0.0           | 2024-05-10T00:30:00.000Z | staging
+;
+
+// A group_left match as an operand of an on(cluster, pod) match: the pod label
+// the inner join carried from its many side keys the outer join.
+// result = (tx_pod / rx_cluster) * rx_pod.
+vector_match_nested_group_left_in_join
+required_capability: promql_command_v0
+required_capability: promql_vector_matching_v0
+PROMQL index=k8s step=10m r=((sum by (cluster, pod) (network.eth0.tx) / on (cluster) group_left sum by (cluster) (network.eth0.rx)) * on (cluster, pod) sum by (cluster, pod) (network.eth0.rx))
+| WHERE cluster == "prod" AND step == "2024-05-10T00:10:00.000Z"
+| KEEP r, cluster, pod, step
+| SORT pod;
+
+r:double           | cluster:keyword | pod:keyword | step:datetime
+185.9090909090909  | prod            | one         | 2024-05-10T00:10:00.000Z
+137.61260330578511 | prod            | three       | 2024-05-10T00:10:00.000Z
+48.94834710743801  | prod            | two         | 2024-05-10T00:10:00.000Z
+;
+
+// A by(cluster) aggregation regroups a group_left match: summing the per-pod
+// ratios over each cluster gives back tx_cluster / rx_cluster. ROUND guards
+// against float summation-order jitter.
+vector_match_nested_sum_by
+required_capability: promql_command_v0
+required_capability: promql_vector_matching_v0
+PROMQL index=k8s step=10m r=(sum by (cluster) (sum by (cluster, pod) (network.eth0.tx) / on (cluster) group_left sum by (cluster) (network.eth0.rx)))
+| EVAL r = ROUND(r, 9)
+| KEEP r, step, cluster
+| SORT cluster, step;
+
+r:double    | step:datetime            | cluster:keyword
+1.103305785 | 2024-05-10T00:10:00.000Z | prod
+1.141151386 | 2024-05-10T00:20:00.000Z | prod
+1.160724081 | 2024-05-10T00:30:00.000Z | prod
+0.973055414 | 2024-05-10T00:10:00.000Z | qa
+1.219419185 | 2024-05-10T00:20:00.000Z | qa
+1.190502333 | 2024-05-10T00:30:00.000Z | qa
+0.934317343 | 2024-05-10T00:10:00.000Z | staging
+1.042685454 | 2024-05-10T00:20:00.000Z | staging
+0.990322581 | 2024-05-10T00:30:00.000Z | staging
+;
+
+// A function call over a match: ceil(tx / rx) per (cluster, step).
+vector_match_nested_function
+required_capability: promql_command_v0
+required_capability: promql_vector_matching_v0
+PROMQL index=k8s step=10m result=(ceil(sum by (cluster) (network.eth0.tx) / on (cluster) sum by (cluster) (network.eth0.rx)))
+| SORT cluster, step;
+
+result:double | step:datetime            | cluster:keyword
+2.0           | 2024-05-10T00:10:00.000Z | prod
+2.0           | 2024-05-10T00:20:00.000Z | prod
+2.0           | 2024-05-10T00:30:00.000Z | prod
+1.0           | 2024-05-10T00:10:00.000Z | qa
+2.0           | 2024-05-10T00:20:00.000Z | qa
+2.0           | 2024-05-10T00:30:00.000Z | qa
+1.0           | 2024-05-10T00:10:00.000Z | staging
+2.0           | 2024-05-10T00:20:00.000Z | staging
+1.0           | 2024-05-10T00:30:00.000Z | staging
+;
+
+// A match nested under a set operator: `and` keeps the ratio rows whose cluster
+// also has a prod-filtered rx series, i.e. only prod's ratios.
+vector_match_nested_join_in_and
+required_capability: promql_command_v0
+required_capability: promql_vector_matching_v0
+PROMQL index=k8s step=10m result=((sum by (cluster) (network.eth0.tx) / on (cluster) sum by (cluster) (network.eth0.rx)) and on (cluster) sum by (cluster) (network.eth0.rx{cluster="prod"}))
+| SORT cluster, step;
+
+result:double      | step:datetime            | cluster:keyword
+1.103305785123967  | 2024-05-10T00:10:00.000Z | prod
+1.1411513859275053 | 2024-05-10T00:20:00.000Z | prod
+1.16072408118486   | 2024-05-10T00:30:00.000Z | prod
+;

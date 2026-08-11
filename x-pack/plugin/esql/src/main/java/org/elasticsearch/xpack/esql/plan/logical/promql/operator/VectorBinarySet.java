@@ -69,7 +69,7 @@ public final class VectorBinarySet extends VectorBinaryOperator {
         return switch (op) {
             case UNION -> unionOutputByName(List.of(left(), right()));
             case INTERSECT, SUBTRACT -> {
-                if (match() == null || match().filter() != VectorMatch.Filter.ON) {
+                if (match() == null || match().condition() != VectorMatch.Condition.ON) {
                     yield left().output();
                 }
                 List<Attribute> result = new ArrayList<>(left().output());

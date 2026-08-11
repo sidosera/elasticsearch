@@ -40,8 +40,8 @@ public class PromqlAttributesTranslationContextTests extends ESTestCase {
         TimeSeriesColumn withoutRegion = TimeSeriesColumn.of(List.of(REGION));
         TimeSeriesColumn withoutPodRegion = TimeSeriesColumn.of(List.of(POD, REGION));
 
-        assertTrue(requirement.success(new Header(List.of(identity), List.of(identity, withoutRegion, withoutPodRegion))));
-        assertFalse(requirement.success(new Header(List.of(identity), List.of(identity, withoutRegion))));
+        assertFalse(requirement.missing(new Header(List.of(identity), List.of(identity, withoutRegion, withoutPodRegion))).isDefined());
+        assertTrue(requirement.missing(new Header(List.of(identity), List.of(identity, withoutRegion))).isDefined());
     }
 
     public void testRequirementChecksTimeSeriesColumnsButAllowsConcreteIdentity() {
@@ -49,9 +49,11 @@ public class PromqlAttributesTranslationContextTests extends ESTestCase {
         TimeSeriesColumn identity = new TimeSeriesColumn(attr(MetadataAttribute.TIMESERIES), List.of());
         TimeSeriesColumn withoutRegion = new TimeSeriesColumn(attr(MetadataAttribute.TIMESERIES), List.of(REGION));
 
-        assertTrue(requirement.success(new Header(List.of(identity), List.of(identity, withoutRegion, new NamedColumn(CLUSTER)))));
-        assertFalse(requirement.success(new Header(List.of(identity), List.of(identity, new NamedColumn(CLUSTER)))));
-        assertTrue(Header.undefined().success(concreteHeader(CLUSTER)));
+        assertFalse(
+            requirement.missing(new Header(List.of(identity), List.of(identity, withoutRegion, new NamedColumn(CLUSTER)))).isDefined()
+        );
+        assertTrue(requirement.missing(new Header(List.of(identity), List.of(identity, new NamedColumn(CLUSTER)))).isDefined());
+        assertFalse(Header.undefined().missing(concreteHeader(CLUSTER)).isDefined());
     }
 
     public void testConcreteLabelWideningPreservesTimeSeriesRequirements() {
@@ -60,24 +62,24 @@ public class PromqlAttributesTranslationContextTests extends ESTestCase {
         TimeSeriesColumn required = TimeSeriesColumn.of(List.of(POD, REGION));
 
         assertThat(requirement.labels(), equalTo(List.of(CLUSTER)));
-        assertTrue(requirement.success(new Header(List.of(identity), List.of(identity, required))));
+        assertFalse(requirement.missing(new Header(List.of(identity), List.of(identity, required))).hasTimeSeriesColumns());
     }
 
     public void testIdentityGroupingDefaultsOnlyUndemandedGrouping() {
         Header surface = Header.undefined().including(List.of(CLUSTER)).withIdentityGrouping();
 
         assertTrue(surface.hasTimeSeriesGrouping());
-        assertTrue(Header.undefined().including(TimeSeriesColumn.of(List.of())).success(surface));
+        assertFalse(Header.undefined().including(TimeSeriesColumn.of(List.of())).missing(surface).isDefined());
         assertThat(surface.labels(), equalTo(List.of(CLUSTER)));
 
         Header concrete = concreteHeader(CLUSTER);
         assertThat(concrete.withIdentityGrouping(), sameInstance(concrete));
     }
 
-    public void testRequiringPinsLeafIdentityWhenGroupByEmpty() {
+    public void testPlusPinsLeafIdentityWhenGroupByEmpty() {
         Header leaf = new Header(List.of(TimeSeriesColumn.of(List.of())), List.of(TimeSeriesColumn.of(List.of())));
         Header withoutPod = leaf.groupedWithout(List.of(POD));
-        Header demand = Header.undefined().requiring(withoutPod).including(List.of(CLUSTER));
+        Header demand = Header.undefined().plus(withoutPod).including(List.of(CLUSTER));
 
         assertTrue(demand.hasTimeSeriesGrouping());
         assertThat(demand.withIdentityGrouping(), sameInstance(demand));
@@ -89,16 +91,16 @@ public class PromqlAttributesTranslationContextTests extends ESTestCase {
             }
             return column;
         });
-        // a second requiring with an already-pinned TA group key only carries the wider identity
-        Header nested = demand.requiring(withoutPod.groupedWithout(List.of(REGION)));
+        // adding a second identity requirement to an already-pinned TA group key only carries the wider identity
+        Header nested = demand.plus(withoutPod.groupedWithout(List.of(REGION)));
         assertThat(nested.groupingExpressions(), hasSize(1));
-        assertTrue(
-            nested.success(
+        assertFalse(
+            nested.missing(
                 new Header(
                     List.of(TimeSeriesColumn.of(List.of(POD))),
                     List.of(TimeSeriesColumn.of(List.of(POD)), TimeSeriesColumn.of(List.of(POD, REGION)))
                 )
-            )
+            ).hasTimeSeriesColumns()
         );
     }
 

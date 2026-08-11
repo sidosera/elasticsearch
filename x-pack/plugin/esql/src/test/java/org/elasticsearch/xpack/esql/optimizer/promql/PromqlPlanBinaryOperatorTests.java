@@ -585,6 +585,27 @@ public class PromqlPlanBinaryOperatorTests extends AbstractPromqlPlanOptimizerTe
         assertThat(keyedLabels(joins.getFirst().left()), containsInAnyOrder("cluster"));
     }
 
+    public void testVectorMatchIgnoringUsesOpaqueOperandDimensions() {
+        var plan = planPromql("PROMQL index=k8s step=5m result=(network.eth0.tx / ignoring (pod) network.eth0.rx)");
+        InnerJoin join = plan.collect(InnerJoin.class).getFirst();
+        assertThat(keyedLabels(join.left()), containsInAnyOrder("cluster", "region"));
+        assertThat(keyedLabels(join.right()), containsInAnyOrder("cluster", "region"));
+    }
+
+    public void testGroupLabelMissingFromBuildDoesNotLeakFromProbe() {
+        var plan = planPromql(
+            "PROMQL index=k8s step=5m result=(sum by (cluster, pod) (network.eth0.tx) "
+                + "/ on (cluster) group_left (pod) sum by (cluster) (network.eth0.rx))"
+        );
+        Alias pod = plan.collect(Eval.class)
+            .stream()
+            .flatMap(eval -> eval.fields().stream())
+            .filter(alias -> alias.name().equals("pod") && alias.child() instanceof Literal)
+            .findFirst()
+            .orElseThrow();
+        assertNull(as(pod.child(), Literal.class).value());
+    }
+
     public void testVectorMatchNestedInScalarArithmetic() {
         // The vector match is nested as the right operand of `1 + (...)`; the join is built and the scalar op wraps its value.
         var plan = planPromql(

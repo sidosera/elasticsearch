@@ -60,11 +60,12 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         BinaryOp binaryOp
     ) {
         super(source, left, right);
-        this.match = match;
+        this.match = Objects.requireNonNull(match, "match must be VectorMatch.NONE rather than null");
         this.dropMetricName = dropMetricName;
         this.binaryOp = binaryOp;
     }
 
+    /** The declared vector matching; {@link VectorMatch#NONE} - never null - when the operator declares none. */
     public VectorMatch match() {
         return match;
     }
@@ -107,30 +108,30 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         List<Attribute> rightAttrs = right().output();
         Set<String> leftLabels = extractLabelNames(leftAttrs);
         Set<String> rightLabels = extractLabelNames(rightAttrs);
-        if (match != null && match.grouping() == VectorMatch.Joining.LEFT) {
+        if (match.joining() == VectorMatch.Joining.LEFT) {
             // group_left: the left ("many") side keeps its full label set plus the match keys; group_left(labels)
             // additionally copies those labels from the right ("one") side onto the result.
             outputLabels = new HashSet<>(leftLabels);
             outputLabels.addAll(matchKeyLabels(leftLabels, rightLabels));
             outputLabels.addAll(match.groupingLabels());
             guaranteed.addAll(match.groupingLabels());
-            if (matchFilter() == VectorMatch.Filter.ON) {
+            if (match.condition() == VectorMatch.Condition.ON) {
                 guaranteed.addAll(match.filterLabels());
             }
-        } else if (match != null && match.grouping() == VectorMatch.Joining.RIGHT) {
+        } else if (match.joining() == VectorMatch.Joining.RIGHT) {
             // group_right: the right ("many") side keeps its full label set plus the match keys; group_right(labels)
             // additionally copies those labels from the left ("one") side onto the result.
             outputLabels = new HashSet<>(rightLabels);
             outputLabels.addAll(matchKeyLabels(leftLabels, rightLabels));
             outputLabels.addAll(match.groupingLabels());
             guaranteed.addAll(match.groupingLabels());
-            if (matchFilter() == VectorMatch.Filter.ON) {
+            if (match.condition() == VectorMatch.Condition.ON) {
                 guaranteed.addAll(match.filterLabels());
             }
-        } else if (matchFilter() == VectorMatch.Filter.ON) {
+        } else if (match.condition() == VectorMatch.Condition.ON) {
             outputLabels = new HashSet<>(match.filterLabels());
             guaranteed.addAll(match.filterLabels());
-        } else if (matchFilter() == VectorMatch.Filter.IGNORING) {
+        } else if (match.condition() == VectorMatch.Condition.IGNORING) {
             outputLabels = new HashSet<>(leftLabels);
             outputLabels.addAll(rightLabels);
             outputLabels.removeAll(match.filterLabels());
@@ -161,7 +162,7 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
 
     /** The label names the match keys on: the on(...) labels, or both sides' declared labels minus the ignoring(...) ones. */
     private Set<String> matchKeyLabels(Set<String> leftLabels, Set<String> rightLabels) {
-        if (matchFilter() == VectorMatch.Filter.ON) {
+        if (match.condition() == VectorMatch.Condition.ON) {
             return match.filterLabels();
         }
         Set<String> keys = new HashSet<>(leftLabels);
@@ -169,13 +170,6 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
         keys.removeAll(match.filterLabels());
         keys.removeIf(MetadataAttribute::isTimeSeriesAttributeName);
         return keys;
-    }
-
-    private VectorMatch.Filter matchFilter() {
-        if (match != null) {
-            return match.filter();
-        }
-        return VectorMatch.Filter.NONE;
     }
 
     private Set<String> extractLabelNames(List<Attribute> attrs) {

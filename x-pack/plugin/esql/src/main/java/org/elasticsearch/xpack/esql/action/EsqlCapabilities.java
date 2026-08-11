@@ -2436,8 +2436,10 @@ public class EsqlCapabilities {
 
         /**
          * Initial support for PromQL vector matching ({@code on}/{@code ignoring}, optionally with {@code group_left}/
-         * {@code group_right}) on arithmetic operators, translated to a coordinator-side INNER equi-join. Only top-level
-         * matching between two aggregated instant vectors (e.g. {@code sum by (...)} ) is supported.
+         * {@code group_right}) on arithmetic, comparison, and set operators, translated to a coordinator-side INNER
+         * equi-join. Operands may be aggregated instant vectors (e.g. {@code sum by (...)}) or raw selectors, and a
+         * matched operator composes like any other expression: it can be nested inside aggregations, functions, or
+         * another matched operator.
          */
         PROMQL_VECTOR_MATCHING_V0(Build.current().isSnapshot()),
 

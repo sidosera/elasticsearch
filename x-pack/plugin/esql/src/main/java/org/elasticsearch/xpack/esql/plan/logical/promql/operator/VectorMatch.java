@@ -16,7 +16,7 @@ import static org.elasticsearch.xpack.esql.core.util.StringUtils.EMPTY;
 
 public class VectorMatch {
 
-    public enum Filter {
+    public enum Condition {
         IGNORING,
         ON,
         NONE
@@ -28,30 +28,30 @@ public class VectorMatch {
         NONE
     }
 
-    public static final VectorMatch NONE = new VectorMatch(Filter.NONE, emptySet(), Joining.NONE, emptySet());
+    public static final VectorMatch NONE = new VectorMatch(Condition.NONE, emptySet(), Joining.NONE, emptySet());
 
-    private final Filter filter;
+    private final Condition condition;
     private final Set<String> filterLabels;
 
     private final Joining joining;
     private final Set<String> groupingLabels;
 
-    public VectorMatch(Filter filter, Set<String> filterLabels, Joining joining, Set<String> groupingLabels) {
-        this.filter = filter;
+    public VectorMatch(Condition condition, Set<String> filterLabels, Joining joining, Set<String> groupingLabels) {
+        this.condition = condition;
         this.filterLabels = filterLabels;
         this.joining = joining;
         this.groupingLabels = groupingLabels;
     }
 
-    public Filter filter() {
-        return filter;
+    public Condition condition() {
+        return condition;
     }
 
     public Set<String> filterLabels() {
         return filterLabels;
     }
 
-    public Joining grouping() {
+    public Joining joining() {
         return joining;
     }
 
@@ -63,7 +63,7 @@ public class VectorMatch {
     public boolean equals(Object o) {
         if (super.equals(o)) {
             VectorMatch that = (VectorMatch) o;
-            return filter == that.filter
+            return condition == that.condition
                 && Objects.equals(filterLabels, that.filterLabels)
                 && joining == that.joining
                 && Objects.equals(groupingLabels, that.groupingLabels);
@@ -73,12 +73,12 @@ public class VectorMatch {
 
     @Override
     public int hashCode() {
-        return Objects.hash(filter, filterLabels, joining, groupingLabels);
+        return Objects.hash(condition, filterLabels, joining, groupingLabels);
     }
 
     @Override
     public String toString() {
-        String filterString = filter != Filter.NONE ? filter.name().toLowerCase(Locale.ROOT) + "(" + filterLabels + ")" : EMPTY;
+        String filterString = condition != Condition.NONE ? condition.name().toLowerCase(Locale.ROOT) + "(" + filterLabels + ")" : EMPTY;
         String groupingString = joining != Joining.NONE
             ? " " + joining.name().toLowerCase(Locale.ROOT) + (groupingLabels.isEmpty() == false ? "(" + groupingLabels + ")" : EMPTY) + " "
             : EMPTY;

@@ -543,8 +543,7 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
                     // columns of its own. on(...)/ignoring(...) matching lowers its keys to concrete labels demanded
                     // from both operand compilations, so opaque operands are supported; the unmatched (merge/bare)
                     // forms match on the operands' explicit grouping labels and cannot see into the packed identity.
-                    boolean labelMatched = binaryOperator.match() != VectorMatch.NONE
-                        && binaryOperator.match().filter() != VectorMatch.Filter.NONE;
+                    boolean labelMatched = binaryOperator.match().condition() != VectorMatch.Condition.NONE;
                     if (labelMatched == false
                         && (usesWithoutGrouping(binaryOperator.left()) || usesWithoutGrouping(binaryOperator.right()))) {
                         failures.add(fail(lp, "binary expressions with WITHOUT are not supported at this time [{}]", lp.sourceText()));
