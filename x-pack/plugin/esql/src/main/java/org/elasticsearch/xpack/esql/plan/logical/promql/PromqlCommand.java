@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.esql.plan.logical.promql;
 
 import org.elasticsearch.common.io.stream.StreamOutput;
+import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
 import org.elasticsearch.xpack.esql.capabilities.TelemetryAware;
 import org.elasticsearch.xpack.esql.common.Failures;
 import org.elasticsearch.xpack.esql.core.QlIllegalArgumentException;
@@ -501,6 +502,10 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
                             );
                         }
                     });
+                    if (binaryOperator.match() != VectorMatch.NONE && EsqlCapabilities.Cap.PROMQL_VECTOR_MATCHING_V0.isEnabled() == false) {
+                        failures.add(fail(lp, "PromQL vector matching is not enabled in this build [{}]", lp.sourceText()));
+                        return;
+                    }
                     // on/ignoring (+ group_left/group_right) vector matching translates arithmetic and comparison operators to an
                     // InnerJoin,
                     // either at the expression root or nested inside an outer operation. Set operators (and/unless/or) are validated
