@@ -25,12 +25,15 @@ public interface StableHashable {
     /**
      * Returns a stable hash for {@code e}.
      *
-     * @throws IllegalStateException if {@code e} does not implement {@link StableHashable}
+     * <p>Falls back to {@link Expression#semanticHash()} for expression types that do not yet
+     * implement {@link StableHashable}. That fallback is non-deterministic across JVM runs, so it
+     * degrades to the old behaviour rather than producing a stable ordering, but it will never
+     * crash query execution.
      */
     static int compute(Expression e) {
         if (e instanceof StableHashable sh) {
             return sh.stableHash();
         }
-        throw new IllegalStateException("Expression does not implement StableHashable: " + e.getClass().getName());
+        return e.semanticHash();
     }
 }

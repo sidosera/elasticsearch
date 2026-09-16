@@ -54,9 +54,15 @@ public abstract class BinaryOperator<T, U, R, F extends PredicateBiFunction<T, U
 
     @Override
     public int stableHash() {
-        // Use canonical children so Add(a,b) and Add(b,a) hash the same.
-        BinaryOperator<?, ?, ?, ?> c = (BinaryOperator<?, ?, ?, ?>) canonical();
-        return Objects.hash(getClass().getName(), StableHashable.compute(c.left()), StableHashable.compute(c.right()));
+        int leftHash = StableHashable.compute(left());
+        int rightHash = StableHashable.compute(right());
+        if (isCommutative()) {
+            // Order-independent: sort the two child hashes so Add(a,b) and Add(b,a) yield the same value.
+            int lo = Math.min(leftHash, rightHash);
+            int hi = Math.max(leftHash, rightHash);
+            return Objects.hash(getClass().getName(), lo, hi);
+        }
+        return Objects.hash(getClass().getName(), leftHash, rightHash);
     }
 
     @Override

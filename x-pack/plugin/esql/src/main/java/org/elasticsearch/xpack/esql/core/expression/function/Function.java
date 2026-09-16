@@ -13,6 +13,7 @@ import org.elasticsearch.xpack.esql.core.expression.StableHashable;
 import org.elasticsearch.xpack.esql.core.tree.NodeStringMapper;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -47,7 +48,7 @@ public abstract class Function extends Expression implements StableHashable {
 
     @Override
     public int stableHash() {
-        return Objects.hash(getClass().getName(), children().stream().mapToInt(StableHashable::compute).boxed().toList());
+        return Objects.hash(getClass().getName(), Arrays.hashCode(children().stream().mapToInt(StableHashable::compute).toArray()));
     }
 
     @Override
