@@ -444,24 +444,34 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
             }
 
             // Ranking happens per series, so the child stays at series grain whatever the enclosing translation regroups
-            // by; the partition labels must be exposed to rank within them.
+            // by; the partition labels must be exposed to rank within them. limit_ratio is membership-neutral:
+            // its sampling key is solely the input vector's identity, so outer partitions are neither required
+            // from the child nor materialized below.
             List<String> partitions = mapFinite(plan.groupings());
-            Header childRequired = required.union(open()).union(finite(partitions));
+            boolean isLimitRatio = plan.definition() == PromqlBuiltinFunctionDefinitions.LIMIT_RATIO;
+            Header childRequired = isLimitRatio ? required.union(open()) : required.union(open()).union(finite(partitions));
             IntermediateResult childResult = new Translation(cmd, analyzer, stepBucketAlias, childRequired, time).doTranslateNode(
                 plan.child()
             );
             if (childResult.kind().constant) {
+                if (isLimitRatio) {
+                    // A constant vector's empty label set is a valid identity: sample it directly with an
+                    // empty key (step only, excluded from hashing), without introducing an aggregation.
+                    List<Expression> key = List.of(childResult.step());
+                    LogicalPlan sampled = new LimitRatioBy(plan.source(), childResult.plan(), plan.parameters().getFirst(), key);
+                    return childResult.with(sampled, childResult.header(), childResult.value());
+                }
                 return childResult;
             }
 
-            var header = childResult.header().union(finite(partitions));
+            var header = isLimitRatio ? childResult.header() : childResult.header().union(finite(partitions));
 
             var promqlCtx = new PromqlContext(time, AggregateFunction.NO_WINDOW, childResult.step(), configuration());
             IntermediateResult aggregated = childResult.kind().afterInitialAggregation
                 ? regroup(childResult, header, false, childResult.value())
                 : collapse(childResult, header, childResult.value());
             LogicalPlan result = plan.definition() == PromqlBuiltinFunctionDefinitions.LIMIT_RATIO
-                ? emitLimitRatioBy(plan, aggregated, partitions)
+                ? emitLimitRatioBy(plan, aggregated)
                 : emitTopNBy(plan, aggregated, partitions, promqlCtx);
             return aggregated.with(result, aggregated.header(), aggregated.value());
         }
@@ -485,19 +495,22 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
         }
 
         /**
-         * Keeps an approximate {@code ratio} of the already-collapsed per-series rows within each step and partition.
-         * Unlike the order-statistic reductions this is not a {@link TopNBy}: the kept subset is selected by hashing
-         * the field key in {@link LimitRatioBy}, so no sort order is built.
+         * Keeps an approximate {@code ratio} of the already-collapsed per-series rows, selected by hashing
+         * the input vector's identity in {@link LimitRatioBy}, so no sort order is built. The sampling key
+         * is membership-neutral: solely the input identity (the {@code _timeseries} blob at series grain,
+         * else the surviving grouping labels or packed label sets), with the step bucket leading the
+         * groupings but excluded from hashing. Outer {@code by} partition labels are neither appended
+         * to the key nor materialized as null columns.
          */
-        private LogicalPlan emitLimitRatioBy(AcrossSeriesReduction reduction, IntermediateResult table, List<String> partitions) {
-            ReductionGrouping grouping = reductionGrouping(reduction, table, partitions);
-            // The sampling key is the groupings without the step bucket: the concrete grouping columns
-            // from below. At series grain that is the _timeseries blob; over an aggregated input the rows
-            // are groups, so their own grain labels are the key (for example pod groups for limit_ratio
-            // over sum by, even when the outer reduction is bare). With no key columns every row shares
-            // one identity, so a single-series result is kept or dropped deterministically.
-            List<Expression> key = new ArrayList<>(grouping.groupings());
-            Attribute series = grouping.plan().output().stream().filter(MetadataAttribute::isTimeSeriesAttribute).findFirst().orElse(null);
+        private LogicalPlan emitLimitRatioBy(AcrossSeriesReduction reduction, IntermediateResult table) {
+            // The sampling key is the step bucket plus the input identity from below. At series grain that
+            // is the _timeseries blob; over an aggregated input the rows are groups, so their own grain
+            // labels are the key (for example pod and cluster groups for limit_ratio over sum by).
+            // With no key columns every row shares one identity, so a single-series result is kept or
+            // dropped deterministically.
+            List<Expression> key = new ArrayList<>();
+            key.add(table.step());
+            Attribute series = table.plan().output().stream().filter(MetadataAttribute::isTimeSeriesAttribute).findFirst().orElse(null);
             if (series != null) {
                 addIfMissing(key, series);
             } else {
@@ -518,7 +531,7 @@ public final class TranslatePromqlToEsqlPlan extends AnalyzerRules.Parameterized
                     addIfMissing(key, carrier);
                 }
             }
-            return new LimitRatioBy(reduction.source(), grouping.plan(), reduction.parameters().getFirst(), key);
+            return new LimitRatioBy(reduction.source(), table.plan(), reduction.parameters().getFirst(), key);
         }
 
         private static void addIfMissing(List<Expression> key, Attribute carrier) {

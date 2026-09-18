@@ -113,6 +113,59 @@ public class HashRatioLimitOperatorTests extends OperatorTestCase {
     }
 
     /**
+     * A constant vector's empty label set hashes to one shared identity: with no key channels
+     * every row encodes identically, so ratio zero drops every row (the instant
+     * {@code limit_ratio(0, vector(1))} case yields zero rows).
+     */
+    public void testEmptyKeyRatioZeroDropsAll() {
+        DriverContext ctx = driverContext();
+        BlockFactory blockFactory = ctx.blockFactory();
+        try (HashRatioLimitOperator op = emptyKeyOp(0.0, blockFactory)) {
+            op.addInput(new Page(BlockTestUtils.asBlock(blockFactory, ElementType.LONG, List.of(1L))));
+            assertThat(op.getOutput(), nullValue());
+        }
+    }
+
+    /**
+     * Ratio one over the empty identity keeps the single row.
+     */
+    public void testEmptyKeyRatioOneKeepsAll() {
+        DriverContext ctx = driverContext();
+        BlockFactory blockFactory = ctx.blockFactory();
+        try (HashRatioLimitOperator op = emptyKeyOp(1.0, blockFactory)) {
+            op.addInput(new Page(BlockTestUtils.asBlock(blockFactory, ElementType.LONG, List.of(1L))));
+            Page out = op.getOutput();
+            try {
+                assertThat(out.getPositionCount(), equalTo(1));
+            } finally {
+                out.releaseBlocks();
+            }
+        }
+    }
+
+    /**
+     * Fractional complementary ratios over the empty identity keep complementary subsets:
+     * exactly one of {@code 0.3} and {@code -0.7} (whose complement threshold is also 0.3)
+     * keeps the rows, without asserting which one (the hash seed varies between JVMs).
+     */
+    public void testEmptyKeyComplementaryFractionalRatios() {
+        int keptPositive = keptEmptyKeyCount(0.3, 3);
+        int keptNegative = keptEmptyKeyCount(-0.7, 3);
+        // One side keeps all rows, the other keeps none; never a strict subset or both.
+        assertThat(keptPositive + keptNegative, equalTo(3));
+        assertThat(keptPositive == 0 || keptPositive == 3, equalTo(true));
+    }
+
+    /**
+     * A range query over a constant shares one empty identity across steps, so a fractional
+     * ratio keeps either all steps or none -- the decision is consistent, never partial.
+     */
+    public void testEmptyKeyConsistentAcrossSteps() {
+        int kept = keptEmptyKeyCount(0.3, 5);
+        assertThat(kept == 0 || kept == 5, equalTo(true));
+    }
+
+    /**
      * A negative ratio keeps exactly the complement of the positive ratio: for r in (0, 1) every
      * row is kept by exactly one of {@code r} and {@code -r}, without coupling the test to
      * specific hash values.
@@ -349,5 +402,33 @@ public class HashRatioLimitOperatorTests extends OperatorTestCase {
                 new PagedBytesBuilder(blockFactory.bigArrays().recycler(), blockFactory.breaker(), "group-key-encoder", 64)
             )
         );
+    }
+
+    private static HashRatioLimitOperator emptyKeyOp(double ratio, BlockFactory blockFactory) {
+        return new HashRatioLimitOperator(
+            ratio,
+            new GroupKeyEncoder(
+                new int[0],
+                List.of(),
+                new PagedBytesBuilder(blockFactory.bigArrays().recycler(), blockFactory.breaker(), "group-key-encoder", 64)
+            )
+        );
+    }
+
+    private int keptEmptyKeyCount(double ratio, int rows) {
+        DriverContext ctx = driverContext();
+        BlockFactory blockFactory = ctx.blockFactory();
+        List<Long> ids = LongStream.range(0, rows).boxed().toList();
+        try (HashRatioLimitOperator op = emptyKeyOp(ratio, blockFactory)) {
+            op.addInput(new Page(BlockTestUtils.asBlock(blockFactory, ElementType.LONG, ids.stream().map(o -> (Object) o).toList())));
+            Page out = op.getOutput();
+            try {
+                return out == null ? 0 : out.getPositionCount();
+            } finally {
+                if (out != null) {
+                    out.releaseBlocks();
+                }
+            }
+        }
     }
 }

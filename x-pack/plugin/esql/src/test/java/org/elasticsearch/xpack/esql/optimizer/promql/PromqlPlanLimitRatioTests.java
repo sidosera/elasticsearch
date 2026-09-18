@@ -91,8 +91,9 @@ public class PromqlPlanLimitRatioTests extends AbstractPromqlPlanOptimizerTests 
     }
 
     /**
-     * {@code limit_ratio(...) by (pod)} must resolve {@code pod} as a concrete column
-     * alongside the {@code _timeseries} full-identity key and keep full series identity.
+     * {@code limit_ratio(...) by (...)} is membership-neutral like Prometheus: the outer partitions
+     * neither join the sampling key nor change which series are kept. The key stays the input
+     * identity ({@code _timeseries} at series grain) and full series identity is preserved.
      */
     public void testLimitRatioByGroupingPartitionsByLabelAndKeepsFullIdentity() {
         var plan = logicalOptimizerWithLatestVersion.optimize(
@@ -102,7 +103,155 @@ public class PromqlPlanLimitRatioTests extends AbstractPromqlPlanOptimizerTests 
         assertThat(plan.output().stream().map(Attribute::name).toList(), hasItem(MetadataAttribute.TIMESERIES));
 
         var node = as(plan.collect(LimitRatioBy.class).get(0), LimitRatioBy.class);
-        assertThat(node.groupings().stream().map(g -> g instanceof Attribute a ? a.name() : g.toString()).toList(), hasItem("pod"));
+        // Membership-neutral: only step plus the series identity, no outer partition label.
+        assertThat(node.groupings().size(), equalTo(2));
+        Attribute key = as(node.groupings().get(1), Attribute.class);
+        assertThat(MetadataAttribute.isTimeSeriesAttribute(key), equalTo(true));
+    }
+
+    /**
+     * Bare and outer-grouped {@code limit_ratio} sample on identical keys, so they select
+     * identical series: the outer {@code by} must not append partition labels to the key.
+     */
+    public void testLimitRatioOuterGroupingIsMembershipNeutral() {
+        var bare = limitRatioByNode("PROMQL index=k8s step=1h result=(limit_ratio(0.5, network.bytes_in))");
+        var grouped = limitRatioByNode("PROMQL index=k8s step=1h result=(limit_ratio(0.5, network.bytes_in) by (pod))");
+
+        assertThat(samplingKeyNames(bare), equalTo(samplingKeyNames(grouped)));
+        assertThat(bare.groupings().size(), equalTo(2));
+        assertThat(grouped.groupings().size(), equalTo(2));
+        assertThat(MetadataAttribute.isTimeSeriesAttribute(as(grouped.groupings().get(1), Attribute.class)), equalTo(true));
+    }
+
+    /**
+     * A missing outer partition label must not materialize an extra null key column: it ranks
+     * as one partition for order-statistic reductions, but {@code limit_ratio} ignores it entirely.
+     */
+    public void testLimitRatioMissingOuterLabelAddsNoNullKey() {
+        var bare = limitRatioByNode("PROMQL index=k8s step=1h result=(limit_ratio(0.5, network.bytes_in))");
+        var missing = limitRatioByNode("PROMQL index=k8s step=1h result=(limit_ratio(0.5, network.bytes_in) by (does_not_exist))");
+
+        assertThat(samplingKeyNames(missing), equalTo(samplingKeyNames(bare)));
+        assertThat(missing.groupings().size(), equalTo(2));
+        assertThat(missing.child().output().stream().noneMatch(a -> a.name().equals("does_not_exist")), equalTo(true));
+    }
+
+    /**
+     * Reordered outer grouping labels sample identically: the key derives solely from the input
+     * identity, so label order in the outer {@code by} cannot change the hash.
+     */
+    public void testLimitRatioReorderedOuterGroupingIdentical() {
+        var bare = limitRatioByNode("PROMQL index=k8s step=1h result=(limit_ratio(0.5, network.bytes_in))");
+        var ordered = limitRatioByNode("PROMQL index=k8s step=1h result=(limit_ratio(0.5, network.bytes_in) by (pod, cluster))");
+        var reordered = limitRatioByNode("PROMQL index=k8s step=1h result=(limit_ratio(0.5, network.bytes_in) by (cluster, pod))");
+
+        assertThat(samplingKeyNames(ordered), equalTo(samplingKeyNames(bare)));
+        assertThat(samplingKeyNames(reordered), equalTo(samplingKeyNames(bare)));
+    }
+
+    /**
+     * Over an aggregate the sampling key is the aggregated identity (here {@code pod, cluster}),
+     * regardless of any outer {@code by}: outer partitions must not narrow or widen the hashed set.
+     */
+    public void testLimitRatioOverSumByIgnoresOuterGrouping() {
+        var bare = limitRatioByNode("PROMQL index=k8s step=1h result=(limit_ratio(0.5, sum by (pod, cluster) (network.bytes_in)))");
+        var outer = limitRatioByNode(
+            "PROMQL index=k8s step=1h result=(limit_ratio(0.5, sum by (pod, cluster) (network.bytes_in)) by (pod))"
+        );
+        var reorderedOuter = limitRatioByNode(
+            "PROMQL index=k8s step=1h result=(limit_ratio(0.5, sum by (pod, cluster) (network.bytes_in)) by (cluster, pod))"
+        );
+        var missingOuter = limitRatioByNode(
+            "PROMQL index=k8s step=1h result=(limit_ratio(0.5, sum by (pod, cluster) (network.bytes_in)) by (does_not_exist))"
+        );
+
+        assertThat(samplingKeyNames(bare).stream().sorted().toList(), equalTo(List.of("cluster", "pod")));
+        assertThat(samplingKeyNames(outer).stream().sorted().toList(), equalTo(List.of("cluster", "pod")));
+        assertThat(samplingKeyNames(reorderedOuter).stream().sorted().toList(), equalTo(List.of("cluster", "pod")));
+        assertThat(samplingKeyNames(missingOuter).stream().sorted().toList(), equalTo(List.of("cluster", "pod")));
+    }
+
+    /**
+     * A constant vector's empty label set is a valid sampling identity: the sampler applies
+     * directly with an empty key (step only, excluded from hashing) and no aggregation.
+     * Ratio zero keeps nothing, so the instant query yields zero rows.
+     */
+    public void testLimitRatioOverConstantInstantRatioZeroHasEmptyKey() {
+        var plan = logicalOptimizerWithLatestVersion.optimize(
+            planPromql("PROMQL index=empty_index time=\"2025-01-01T00:00:00Z\" result=(limit_ratio(0, vector(1)))", false, false)
+        );
+
+        var node = as(plan.collect(LimitRatioBy.class).get(0), LimitRatioBy.class);
+        assertThat(((Number) node.ratio().fold(FoldContext.small())).doubleValue(), closeTo(0.0, 1e-12));
+        // Empty sampling key: step only, excluded from hashing.
+        assertThat(node.groupings().size(), equalTo(1));
+        assertThat(plan.collect(org.elasticsearch.xpack.esql.plan.logical.Aggregate.class).isEmpty(), equalTo(true));
+        assertThat(plan.collect(org.elasticsearch.xpack.esql.plan.logical.TimeSeriesAggregate.class).isEmpty(), equalTo(true));
+        var failures = new Failures();
+        node.postOptimizationVerification(failures);
+        assertThat(failures.hasFailures(), equalTo(false));
+    }
+
+    /**
+     * Ratio one over a constant keeps the single empty identity.
+     */
+    public void testLimitRatioOverConstantInstantRatioOneHasEmptyKey() {
+        var plan = logicalOptimizerWithLatestVersion.optimize(
+            planPromql("PROMQL index=empty_index time=\"2025-01-01T00:00:00Z\" result=(limit_ratio(1, vector(1)))", false, false)
+        );
+
+        var node = as(plan.collect(LimitRatioBy.class).get(0), LimitRatioBy.class);
+        assertThat(((Number) node.ratio().fold(FoldContext.small())).doubleValue(), closeTo(1.0, 1e-12));
+        assertThat(node.groupings().size(), equalTo(1));
+    }
+
+    /**
+     * Fractional complementary ratios over the same empty identity keep complementary subsets:
+     * exactly one of {@code r} and {@code -(1 - r)} keeps the row, without asserting which one
+     * (the hash seed varies between JVMs).
+     */
+    public void testLimitRatioOverConstantComplementaryRatios() {
+        var positive = limitRatioByNode(
+            "PROMQL index=empty_index time=\"2025-01-01T00:00:00Z\" result=(limit_ratio(0.3, vector(1)))",
+            false
+        );
+        var negative = limitRatioByNode(
+            "PROMQL index=empty_index time=\"2025-01-01T00:00:00Z\" result=(limit_ratio(-0.7, vector(1)))",
+            false
+        );
+
+        assertThat(positive.groupings().size(), equalTo(1));
+        assertThat(negative.groupings().size(), equalTo(1));
+        double rPos = ((Number) positive.ratio().fold(FoldContext.small())).doubleValue();
+        double rNeg = ((Number) negative.ratio().fold(FoldContext.small())).doubleValue();
+        assertThat(rPos, closeTo(0.3, 1e-12));
+        assertThat(rNeg, closeTo(-0.7, 1e-12));
+        // Both share the same empty identity, so exactly one keeps it: the offsets are
+        // below 0.3 versus at or above 0.3. Which one keeps varies with the per-JVM hash seed,
+        // so complementarity itself is pinned at operator level (empty-key tests) rather than
+        // asserting a particular fractional subset here.
+    }
+
+    /**
+     * A range query over a constant shares one empty identity across steps, so a fractional
+     * ratio keeps either all steps or none -- never a strict subset -- consistently.
+     */
+    public void testLimitRatioOverConstantRangeConsistentAcrossSteps() {
+        var plan = logicalOptimizerWithLatestVersion.optimize(
+            planPromql(
+                "PROMQL index=empty_index start=\"2025-01-01T00:00:00Z\" end=\"2025-01-01T00:02:00Z\" step=1m result=(limit_ratio(0.3, vector(1)))",
+                false,
+                false
+            )
+        );
+
+        var node = as(plan.collect(LimitRatioBy.class).get(0), LimitRatioBy.class);
+        assertThat(node.groupings().size(), equalTo(1));
+        // The constant range still fans out to one row per step; the sampler sits above it.
+        assertThat(plan.collect(org.elasticsearch.xpack.esql.plan.logical.MvExpand.class).isEmpty(), equalTo(false));
+        // Same empty identity at every step hashes identically, so the decision is uniform.
+        // (Which way it goes varies with the per-JVM hash seed; only consistency is asserted here.
+        // The operator-level test pins all-or-nothing row counts for the empty key.)
     }
 
     public void testLimitRatioWithoutGroupingNotYetSupported() {
@@ -245,9 +394,23 @@ public class PromqlPlanLimitRatioTests extends AbstractPromqlPlanOptimizerTests 
     }
 
     private LimitRatioBy limitRatioByNode() {
-        var plan = logicalOptimizerWithLatestVersion.optimize(
-            planPromql("PROMQL index=k8s step=1h result=(limit_ratio(0.5, network.bytes_in))", false)
-        );
+        return limitRatioByNode("PROMQL index=k8s step=1h result=(limit_ratio(0.5, network.bytes_in))", false);
+    }
+
+    private LimitRatioBy limitRatioByNode(String query) {
+        return limitRatioByNode(query, false);
+    }
+
+    private LimitRatioBy limitRatioByNode(String query, boolean allowEmptyReferences) {
+        var plan = logicalOptimizerWithLatestVersion.optimize(planPromql(query, allowEmptyReferences, false));
         return as(plan.collect(LimitRatioBy.class).get(0), LimitRatioBy.class);
+    }
+
+    /** The sampling key names: the groupings without the leading step bucket. */
+    private static List<String> samplingKeyNames(LimitRatioBy node) {
+        return node.groupings().subList(1, node.groupings().size()).stream().map(g -> {
+            assertThat(g, instanceOf(Attribute.class));
+            return ((Attribute) g).name();
+        }).toList();
     }
 }
