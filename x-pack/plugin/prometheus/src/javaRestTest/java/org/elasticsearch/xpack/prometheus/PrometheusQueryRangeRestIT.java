@@ -19,7 +19,9 @@ import java.time.Instant;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 
@@ -534,6 +536,52 @@ public class PrometheusQueryRangeRestIT extends AbstractPrometheusRestIT {
             assertBinopRangeValues("{__name__=\"tx\",__name__!=\"tx\"}");
             wipeDefaultStream();
         }
+    }
+
+    /**
+     * Selecting metrics by name reads the same samples as naming each metric: every step of each selected metric's series
+     * equals the series of the exact metric name, through lookback, range functions and offsets alike.
+     */
+    public void testRangeMetricsSelectedByNameMatchExactNames() throws Exception {
+        for (var ingestion : allIngestionPaths()) {
+            ingestion.ingest(QUERY_END);
+            for (String template : List.of("%s", "max_over_time(%s[1m])", "count_over_time(%s[1m])", "rate(%s[1m])", "%s offset 30s")) {
+                Map<String, List<List<Object>>> byName = rangeValuesByName(
+                    String.format(Locale.ROOT, template, "{__name__=~\"tx|rx\",host=\"a\"}")
+                );
+                for (String metric : List.of("tx", "rx")) {
+                    String exact = String.format(Locale.ROOT, template, metric + "{host=\"a\"}");
+                    List<List<Object>> expected = singleRangeSeries(exact);
+                    assertThat(exact, byName.get(metric), equalTo(expected));
+                }
+                assertThat(template, byName.keySet(), equalTo(Set.of("tx", "rx")));
+            }
+            assertBinopRangeValues("{__name__!=\"tx\",host=\"a\"}", 2);
+            assertBinopRangeValues("sum({__name__=~\"tx|rx\",cluster=\"prod\"})", 10 + 30 + 2 + 3);
+            wipeDefaultStream();
+        }
+    }
+
+    /** The values of each series of a range query, by the name of its metric. */
+    private Map<String, List<List<Object>>> rangeValuesByName(String expression) throws IOException {
+        List<Map<String, Object>> result = executeBinopRangeQuery(expression).evaluate("data.result");
+        Map<String, List<List<Object>>> byName = new HashMap<>();
+        for (Map<String, Object> series : result) {
+            @SuppressWarnings("unchecked")
+            Map<String, String> metric = (Map<String, String>) series.get("metric");
+            @SuppressWarnings("unchecked")
+            List<List<Object>> values = (List<List<Object>>) series.get("values");
+            assertNull(expression + ": duplicate series " + metric, byName.put(metric.get("__name__"), values));
+        }
+        return byName;
+    }
+
+    private List<List<Object>> singleRangeSeries(String expression) throws IOException {
+        List<Map<String, Object>> result = executeBinopRangeQuery(expression).evaluate("data.result");
+        assertThat(expression, result, hasSize(1));
+        @SuppressWarnings("unchecked")
+        List<List<Object>> values = (List<List<Object>>) result.getFirst().get("values");
+        return values;
     }
 
     private ObjectPath executeBinopRangeQuery(String expression) throws IOException {

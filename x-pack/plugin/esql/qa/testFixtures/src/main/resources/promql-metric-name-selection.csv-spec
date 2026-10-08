@@ -1,0 +1,111 @@
+// PromQL selectors that name no single metric, over two ingest-shaped fixtures:
+// - otel-metrics: OTel attributes.* passthrough, metrics under a plain `metrics` object (metrics.cpu_time)
+// - prom-metrics-name: remote-write labels.* passthrough with a stored labels.__name__ that does not name the metric field
+//   (metrics.requests), which never decides what is selected
+//
+// Each selected metric is a series of its own, named by the `__name__` column: the name an exact metric name would read the
+// metric under, here its full path. Stored __name__ labels stay out of `_timeseries` so the name is reported once.
+
+
+selectByNamePatternOtel
+required_capability: promql_command_v0
+required_capability: fix_promql_time_bucket_v2
+required_capability: fix_ts_block_loader_passthrough_aliasing
+required_capability: promql_metric_name_selection
+PROMQL index=otel-metrics step=1h result=({__name__=~"metrics\\.cpu.*", cpu="user"})
+| KEEP result, __name__, _timeseries
+| SORT result;
+
+result:double | __name__:keyword    | _timeseries:keyword
+2.0           | metrics.cpu_time    | "{""attributes"":{""cpu"":""user"",""state"":""idle""}}"
+10.0          | metrics.cpu_time    | "{""attributes"":{""cpu"":""user"",""state"":""active""}}"
+;
+
+
+selectByNegativeNameMatcherIgnoresStoredName
+required_capability: promql_command_v0
+required_capability: fix_promql_time_bucket_v2
+required_capability: fix_ts_block_loader_passthrough_aliasing
+required_capability: promql_metric_name_selection
+PROMQL index=prom-metrics-name step=1h result=({__name__!="requests_total", pod="podA"})
+| KEEP result, __name__, _timeseries
+| SORT result;
+
+result:double | __name__:keyword    | _timeseries:keyword
+10.0          | metrics.requests    | "{""labels"":{""pod"":""podA"",""zone"":""eu""}}"
+;
+
+
+selectByLabelsOnly
+required_capability: promql_command_v0
+required_capability: fix_promql_time_bucket_v2
+required_capability: fix_ts_block_loader_passthrough_aliasing
+required_capability: promql_metric_name_selection
+PROMQL index=otel-metrics step=1h result=(sum by (state) ({cpu="system"}))
+| KEEP result, state
+| SORT state;
+
+result:double | state:keyword
+5.0           | active
+1.0           | idle
+;
+
+
+sumByMatchesExactName
+required_capability: promql_command_v0
+required_capability: fix_promql_time_bucket_v2
+required_capability: fix_ts_block_loader_passthrough_aliasing
+required_capability: promql_metric_name_selection
+PROMQL index=otel-metrics step=1h result=(sum by (cpu) ({__name__=~"metrics\\.cpu_.*"}))
+| KEEP result, cpu
+| SORT cpu;
+
+result:double | cpu:keyword
+6.0           | system
+12.0          | user
+;
+
+
+sumByExactName
+required_capability: promql_command_v0
+required_capability: fix_promql_time_bucket_v2
+required_capability: fix_ts_block_loader_passthrough_aliasing
+PROMQL index=otel-metrics step=1h result=(sum by (cpu) (metrics.cpu_time))
+| KEEP result, cpu
+| SORT cpu;
+
+result:double | cpu:keyword
+6.0           | system
+12.0          | user
+;
+
+
+selectAcrossLayoutsInOneQuery
+required_capability: promql_command_v0
+required_capability: fix_promql_time_bucket_v2
+required_capability: fix_ts_block_loader_passthrough_aliasing
+required_capability: promql_metric_name_selection
+PROMQL index=otel-metrics,prom-metrics-name step=1h result=(count by (__name__) ({__name__=~"metrics\\..*"}))
+| KEEP result, step, __name__
+| SORT step, __name__;
+
+result:double | step:datetime            | __name__:keyword
+4.0           | 2024-05-10T01:00:00.000Z | metrics.cpu_time
+3.0           | 2024-05-10T01:00:00.000Z | metrics.requests
+1.0           | 2024-05-10T02:00:00.000Z | metrics.requests
+;
+
+
+rangeFunctionOverSelectedMetrics
+required_capability: promql_command_v0
+required_capability: fix_promql_time_bucket_v2
+required_capability: fix_ts_block_loader_passthrough_aliasing
+required_capability: promql_metric_name_selection
+PROMQL index=otel-metrics,prom-metrics-name step=1h result=(max(max_over_time({__name__=~"metrics\\..*"}[1h])))
+| KEEP result, step
+| SORT step;
+
+result:double | step:datetime
+20.0          | 2024-05-10T01:00:00.000Z
+4.0           | 2024-05-10T02:00:00.000Z
+;
