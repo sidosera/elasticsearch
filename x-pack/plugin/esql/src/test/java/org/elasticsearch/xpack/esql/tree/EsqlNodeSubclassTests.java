@@ -90,6 +90,8 @@ import org.elasticsearch.xpack.esql.plan.logical.local.ResolvingProject;
 import org.elasticsearch.xpack.esql.plan.logical.promql.HistogramFraction;
 import org.elasticsearch.xpack.esql.plan.logical.promql.HistogramQuantile;
 import org.elasticsearch.xpack.esql.plan.logical.promql.UnresolvedPromqlFunction;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.MetricNameMatchers;
 import org.elasticsearch.xpack.esql.plan.physical.CompoundOutputEvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.EsStatsQueryExec;
@@ -688,6 +690,13 @@ public class EsqlNodeSubclassTests<T extends B, B extends Node<B>> extends NodeS
 
         if (argClass == PromqlFunctionDefinition.class) {
             return PromqlBuiltinFunctionDefinitions.VECTOR;
+        }
+
+        if (argClass == MetricNameMatchers.class) {
+            // final type, can't be mocked
+            return new MetricNameMatchers(
+                List.of(new LabelMatcher(LabelMatcher.NAME, randomAlphaOfLength(5), randomFrom(LabelMatcher.Matcher.values())))
+            );
         }
 
         if (argClass == UnmappedFieldsPattern.class) {

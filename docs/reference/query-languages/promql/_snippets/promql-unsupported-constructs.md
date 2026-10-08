@@ -11,7 +11,7 @@ The following constructs are not evaluated yet, so they return a client error (4
 - Group modifiers: `on(...)`, `ignoring(...)`, `group_left`, `group_right`.
 - The `@` modifier.
 - Subqueries, such as `max_over_time(rate(http_requests_total)[1h:])`.
-- Selectors without a metric name, and regex matchers on `__name__`, such as `{__name__=~"node_.*"}`.
+- Selectors that don't name exactly one metric: selectors without a metric name, and negative or regex matchers on `__name__`, such as `{__name__=~"node_.*"}` or `{__name__!="up", job="node"}`. Matchers on `__name__` are supported alongside an equality that names the metric, such as `{__name__="up", __name__!~"node_.*"}`.
 - Binary expressions with a `without(...)` aggregation as an operand, and `without(...)` aggregations nested inside another `without(...)` aggregation, such as `sum without (pod) (max without (container) (...))`. Use `by(...)` instead.
 - {applies_to}`stack: ga 9.5+` {applies_to}`serverless: ga` Binary expressions whose operands use different `offset` values, such as `rate(http_requests_total) / rate(http_requests_total offset 1h)`. This restriction doesn't apply to `or`.
 - {applies_to}`stack: ga 9.5+` {applies_to}`serverless: ga` Binary expressions where both operands read metrics and one of them nests an aggregation inside another aggregation, such as `count(count by (pod) (up)) / sum(machine_count)`. Nested aggregations on their own, such as `sum(sum by (pod) (...))`, are supported.

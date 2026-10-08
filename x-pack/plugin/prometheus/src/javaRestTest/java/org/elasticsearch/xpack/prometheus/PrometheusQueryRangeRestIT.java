@@ -518,6 +518,24 @@ public class PrometheusQueryRangeRestIT extends AbstractPrometheusRestIT {
         assertThat(byHost, equalTo(Map.of("<absent>", 10.0, "b", 30.0, "c", 12.0)));
     }
 
+    /** The spelling of the metric name and its position among the matchers do not change the result of a range query. */
+    public void testRangeNameMatcherPositionDoesNotChangeTheResult() throws Exception {
+        for (var ingestion : allIngestionPaths()) {
+            ingestion.ingest(QUERY_END);
+            for (String query : List.of(
+                "tx{host=\"a\"}",
+                "{host=\"a\",__name__=\"tx\"}",
+                "{__name__=\"tx\",host=\"a\"}",
+                "{\"tx\",host=\"a\"}",
+                "{__name__!=\"rx\",__name__=\"tx\",host=\"a\"}"
+            )) {
+                assertBinopRangeValues(query, 10);
+            }
+            assertBinopRangeValues("{__name__=\"tx\",__name__!=\"tx\"}");
+            wipeDefaultStream();
+        }
+    }
+
     private ObjectPath executeBinopRangeQuery(String expression) throws IOException {
         Request request = prometheusReadRequest(
             "/_prometheus/api/v1/query_range",

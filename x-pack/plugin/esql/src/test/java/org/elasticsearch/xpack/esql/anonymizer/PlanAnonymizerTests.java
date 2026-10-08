@@ -41,7 +41,7 @@ import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.UnresolvedRelation;
 import org.elasticsearch.xpack.esql.plan.logical.UriParts;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
-import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatchers;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.MetricNameMatchers;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.UriPartsExec;
@@ -593,18 +593,44 @@ public class PlanAnonymizerTests extends ESTestCase {
         String regValue = "customer-secret-5..";
         String nregValue = "internal-prod-.*";
         // Cover EQ plus the regex matchers (REG / NREG) — all route the value through mapper.column.
-        LabelMatchers matchers = new LabelMatchers(
+        List<LabelMatcher> matchers = List.of(
+            new LabelMatcher(labelName, eqValue, LabelMatcher.Matcher.EQ),
+            new LabelMatcher("status", regValue, LabelMatcher.Matcher.REG),
+            new LabelMatcher("env", nregValue, LabelMatcher.Matcher.NREG)
+        );
+
+        StringBuilder anon = new StringBuilder();
+        StringBuilder identity = new StringBuilder();
+        for (LabelMatcher matcher : matchers) {
+            matcher.nodeString(anon, Node.NodeStringFormat.LIMITED, ctx.mapper());
+            matcher.nodeString(identity, Node.NodeStringFormat.LIMITED, NodeStringMapper.IDENTITY);
+        }
+        for (String secret : List.of(labelName, eqValue, regValue, nregValue, "status", "env")) {
+            assertFalse("PROMQL label content leaked '" + secret + "': " + anon, anon.toString().contains(secret));
+        }
+        assertEquals(
+            "identity rendering must be byte-identical to toString()",
+            String.join("", matchers.stream().map(LabelMatcher::toString).toList()),
+            identity.toString()
+        );
+    }
+
+    /** The metric name matchers of a PROMQL selector render their (potentially sensitive) names through the mapper too. */
+    public void testPromqlMetricNameMatchersAnonymized() {
+        var ctx = AnonymizationContext.forSubmission(randomUUID());
+        String metricName = "customer_secret_requests_total";
+        String pattern = "customer_secret_.*";
+        MetricNameMatchers matchers = new MetricNameMatchers(
             List.of(
-                new LabelMatcher(labelName, eqValue, LabelMatcher.Matcher.EQ),
-                new LabelMatcher("status", regValue, LabelMatcher.Matcher.REG),
-                new LabelMatcher("env", nregValue, LabelMatcher.Matcher.NREG)
+                new LabelMatcher(LabelMatcher.NAME, metricName, LabelMatcher.Matcher.EQ),
+                new LabelMatcher(LabelMatcher.NAME, pattern, LabelMatcher.Matcher.REG)
             )
         );
 
         StringBuilder anon = new StringBuilder();
         matchers.nodeString(anon, Node.NodeStringFormat.LIMITED, ctx.mapper());
-        for (String secret : List.of(labelName, eqValue, regValue, nregValue, "status", "env")) {
-            assertFalse("PROMQL label content leaked '" + secret + "': " + anon, anon.toString().contains(secret));
+        for (String secret : List.of(metricName, pattern)) {
+            assertFalse("PROMQL metric name leaked '" + secret + "': " + anon, anon.toString().contains(secret));
         }
 
         StringBuilder identity = new StringBuilder();

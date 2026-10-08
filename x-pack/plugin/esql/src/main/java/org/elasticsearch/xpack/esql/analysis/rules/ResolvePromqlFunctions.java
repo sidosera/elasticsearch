@@ -296,8 +296,8 @@ public class ResolvePromqlFunctions extends ParameterizedAnalyzerRule<PromqlComm
             selector.source(),
             selector.child(),
             selector.series(),
-            selector.labels(),
-            selector.labelMatchers(),
+            selector.metricName(),
+            selector.labelPredicates(),
             Literal.timeDuration(selector.source(), PromqlLogicalPlanBuilder.IMPLICIT_RANGE_PLACEHOLDER),
             selector.evaluation()
         );

@@ -635,6 +635,68 @@ public class PrometheusInstantQueryRestIT extends AbstractPrometheusRestIT {
         assertBinopInstantValues("count without (host) (sum by (host) (tx) / sum by (host) (rx))", 3);
     }
 
+    /**
+     * Prometheus reads {@code {__name__="tx",host="a"}} the same as {@code tx{host="a"}}: neither the spelling of the metric name
+     * nor its position among the label matchers changes which labels the other matchers filter on.
+     */
+    public void testInstantNameMatcherPositionDoesNotChangeTheResult() throws Exception {
+        for (var ingestion : allIngestionPaths()) {
+            ingestion.ingest(QUERY_TIME);
+            for (String query : List.of(
+                "tx{host=\"a\"}",
+                "{host=\"a\",__name__=\"tx\"}",
+                "{__name__=\"tx\",host=\"a\"}",
+                "{\"tx\",host=\"a\"}",
+                "{host=\"a\",\"tx\"}"
+            )) {
+                assertBinopInstantValues(query, 10);
+            }
+            assertBinopInstantGroups("sum by (host) ({__name__=\"tx\",cluster=\"prod\"})", "host", Map.of("a", 10.0, "b", 30.0));
+            wipeDefaultStream();
+        }
+    }
+
+    /**
+     * The {@code __name__} matchers are a conjunction: an equality names the metric, the other matchers must accept that name,
+     * and matchers that admit no common name select nothing.
+     */
+    public void testInstantNameMatchersResolveTogether() throws Exception {
+        for (var ingestion : allIngestionPaths()) {
+            ingestion.ingest(QUERY_TIME);
+            assertBinopInstantValues("{__name__!=\"rx\",__name__=\"tx\",host=\"a\"}", 10);
+            assertBinopInstantValues("{__name__=\"tx\",__name__=~\"t.*\",host=\"a\"}", 10);
+            assertBinopInstantValues("{__name__=~\"tx\",host=\"a\"}", 10);
+            assertBinopInstantValues("{__name__=\"tx\",__name__!=\"tx\"}");
+            assertBinopInstantValues("{__name__=\"tx\",__name__=~\"r.*\",host=\"a\"}");
+            assertBinopInstantValues("{\"tx\",\"rx\"}");
+            assertBinopInstantValues("sum({__name__=\"tx\",__name__!=\"tx\"})");
+            assertBinopInstantValues("tx{host=\"a\"} + {\"tx\",\"rx\"}");
+            wipeDefaultStream();
+        }
+    }
+
+    /**
+     * A negative or pattern {@code __name__} matcher never names the metric to read: without an exact name the selector must
+     * select metrics by name, which is not supported yet. The query is rejected rather than answered from the wrong metric.
+     */
+    public void testInstantNameMatchersWithoutExactNameAreRejected() throws Exception {
+        ingestTestDataUsingRemoteWrite(QUERY_TIME);
+        for (var entry : Map.of(
+            "{__name__!=\"tx\",host=\"a\"}",
+            "negative label selectors on __name__ are not supported at this time",
+            "{__name__!~\"tx\",host=\"a\"}",
+            "regex label selectors on __name__ are not supported at this time",
+            "{__name__=~\"t.*\",host=\"a\"}",
+            "regex label selectors on __name__ are not supported at this time",
+            "{host=\"a\"}",
+            "__name__ label selector is required at this time"
+        ).entrySet()) {
+            ResponseException error = expectThrows(ResponseException.class, () -> executeBinopInstantQuery(entry.getKey()));
+            assertThat(entry.getKey(), error.getResponse().getStatusLine().getStatusCode(), equalTo(400));
+            assertThat(entry.getKey(), EntityUtils.toString(error.getResponse().getEntity()), containsString(entry.getValue()));
+        }
+    }
+
     /** Prometheus converts k with an integer cast: {@code topk(1.5, tx)} keeps one series and {@code topk(0.5, tx)} none. */
     public void testInstantFractionalKIsTruncated() throws Exception {
         ingestTestDataUsingRemoteWrite(QUERY_TIME);

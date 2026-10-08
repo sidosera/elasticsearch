@@ -4328,6 +4328,13 @@ public class EsqlCapabilities {
          */
         EXTERNAL_DATASET_DATE_NANOS_BARE_NUMBER_IS_EPOCH_MILLIS,
 
+        /**
+         * PromQL selectors resolve their {@code __name__} matchers together and bind every other matcher to its own label:
+         * {@code {__name__="tx",host="a"}} and {@code {"tx",host="a"}} read like {@code tx{host="a"}}, contradictory name
+         * matchers select nothing, and a negative {@code __name__} matcher no longer reads the metric it excludes.
+         */
+        FIX_PROMQL_SELECTOR_NAME_MATCHERS,
+
         // Last capability should still have a comma for fewer merge conflicts when adding new ones :)
         // This comment prevents the semicolon from being on the previous capability when Spotless formats the file.
         ;

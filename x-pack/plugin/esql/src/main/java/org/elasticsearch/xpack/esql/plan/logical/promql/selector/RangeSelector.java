@@ -41,24 +41,24 @@ public final class RangeSelector extends Selector {
     public RangeSelector(
         Source source,
         Expression series,
-        List<Expression> labels,
-        LabelMatchers labelMatchers,
+        MetricNameMatchers metricName,
+        List<LabelPredicate> labelPredicates,
         Expression range,
         Evaluation evaluation
     ) {
-        this(source, PlaceholderRelation.INSTANCE, series, labels, labelMatchers, range, evaluation);
+        this(source, PlaceholderRelation.INSTANCE, series, metricName, labelPredicates, range, evaluation);
     }
 
     public RangeSelector(
         Source source,
         LogicalPlan child,
         Expression series,
-        List<Expression> labels,
-        LabelMatchers labelMatchers,
+        MetricNameMatchers metricName,
+        List<LabelPredicate> labelPredicates,
         Expression range,
         Evaluation evaluation
     ) {
-        super(source, child, series, labels, labelMatchers, evaluation);
+        super(source, child, series, metricName, labelPredicates, evaluation);
         this.range = range;
     }
 
@@ -68,12 +68,12 @@ public final class RangeSelector extends Selector {
 
     @Override
     protected NodeInfo<RangeSelector> info() {
-        return NodeInfo.create(this, RangeSelector::new, child(), series(), labels(), labelMatchers(), range, evaluation());
+        return NodeInfo.create(this, RangeSelector::new, child(), series(), metricName(), labelPredicates(), range, evaluation());
     }
 
     @Override
     public RangeSelector replaceChild(LogicalPlan newChild) {
-        return new RangeSelector(source(), newChild, series(), labels(), labelMatchers(), range, evaluation());
+        return new RangeSelector(source(), newChild, series(), metricName(), labelPredicates(), range, evaluation());
     }
 
     // @Override
@@ -109,6 +109,6 @@ public final class RangeSelector extends Selector {
     /** A range selector reads the raw samples; the enclosing function call applies the window. */
     @Override
     public IntermediateResult translate(TranslationContext context) {
-        return translateSeries(context, series());
+        return translateSeries(context, samples());
     }
 }

@@ -164,6 +164,11 @@ public class LabelMatcher implements NodeStringRenderable {
         return Operations.run(automaton(), EMPTY);
     }
 
+    /** Whether a label holding {@code value} satisfies this matcher. */
+    public boolean matches(String value) {
+        return Operations.run(automaton(), value);
+    }
+
     public boolean isNegation() {
         return matcher == NEQ || matcher == NREG;
     }

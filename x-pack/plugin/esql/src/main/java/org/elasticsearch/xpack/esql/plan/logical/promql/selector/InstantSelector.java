@@ -46,29 +46,35 @@ import java.util.List;
  */
 public final class InstantSelector extends Selector {
 
-    public InstantSelector(Source source, Expression series, List<Expression> labels, LabelMatchers labelMatchers, Evaluation evaluation) {
-        this(source, PlaceholderRelation.INSTANCE, series, labels, labelMatchers, evaluation);
+    public InstantSelector(
+        Source source,
+        Expression series,
+        MetricNameMatchers metricName,
+        List<LabelPredicate> labelPredicates,
+        Evaluation evaluation
+    ) {
+        this(source, PlaceholderRelation.INSTANCE, series, metricName, labelPredicates, evaluation);
     }
 
     public InstantSelector(
         Source source,
         LogicalPlan child,
         Expression series,
-        List<Expression> labels,
-        LabelMatchers labelMatchers,
+        MetricNameMatchers metricName,
+        List<LabelPredicate> labelPredicates,
         Evaluation evaluation
     ) {
-        super(source, child, series, labels, labelMatchers, evaluation);
+        super(source, child, series, metricName, labelPredicates, evaluation);
     }
 
     @Override
     protected NodeInfo<InstantSelector> info() {
-        return NodeInfo.create(this, InstantSelector::new, child(), series(), labels(), labelMatchers(), evaluation());
+        return NodeInfo.create(this, InstantSelector::new, child(), series(), metricName(), labelPredicates(), evaluation());
     }
 
     @Override
     public InstantSelector replaceChild(LogicalPlan newChild) {
-        return new InstantSelector(source(), newChild, series(), labels(), labelMatchers(), evaluation());
+        return new InstantSelector(source(), newChild, series(), metricName(), labelPredicates(), evaluation());
     }
 
     // @Override
@@ -109,6 +115,6 @@ public final class InstantSelector extends Selector {
     /** An instant selector maps to LastOverTime to get the latest sample per time series. */
     @Override
     public IntermediateResult translate(TranslationContext context) {
-        return translateSeries(context, new LastOverTime(source(), series(), AggregateFunction.NO_WINDOW, context.time()));
+        return translateSeries(context, new LastOverTime(source(), samples(), AggregateFunction.NO_WINDOW, context.time()));
     }
 }

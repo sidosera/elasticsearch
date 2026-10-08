@@ -37,7 +37,9 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryCom
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryOperator;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinarySet;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LiteralSelector;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.MetricNameMatchers;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.RangeSelector;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.Selector;
 
@@ -446,11 +448,10 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
         p.forEachDown(lp -> {
             switch (lp) {
                 case Selector s -> {
-                    if (s.labelMatchers().nameLabel() != null && s.labelMatchers().nameLabel().matcher().isRegex()) {
-                        failures.add(fail(s, "regex label selectors on __name__ are not supported at this time [{}]", s.sourceText()));
-                    }
-                    if (s.series() == null) {
-                        failures.add(fail(s, "__name__ label selector is required at this time [{}]", s.sourceText()));
+                    if (s instanceof LiteralSelector == false && s.metricName().selection() == MetricNameMatchers.Selection.GENERAL) {
+                        // TODO: Select metrics by a general name constraint instead of reading the one metric it names.
+                        // https://github.com/elastic/elasticsearch/issues/146977
+                        failures.add(fail(s, unsupportedNameSelector(s), s.sourceText()));
                     }
                     if (s.evaluation() != null) {
                         // Only constant per-selector time shift is supported at the moment.
@@ -611,6 +612,21 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
         });
 
         verifyMetadataManipulationPlacement(p, null, failures);
+    }
+
+    /**
+     * The failure for a selector whose metric name constraints do not reduce to one metric or to none: only an exact metric
+     * name has a metric field to read.
+     */
+    private static String unsupportedNameSelector(Selector selector) {
+        List<LabelMatcher> matchers = selector.metricName().matchers();
+        if (matchers.isEmpty()) {
+            return "__name__ label selector is required at this time [{}]";
+        }
+        if (matchers.stream().anyMatch(m -> m.matcher().isRegex())) {
+            return "regex label selectors on __name__ are not supported at this time [{}]";
+        }
+        return "negative label selectors on __name__ are not supported at this time [{}]";
     }
 
     /**

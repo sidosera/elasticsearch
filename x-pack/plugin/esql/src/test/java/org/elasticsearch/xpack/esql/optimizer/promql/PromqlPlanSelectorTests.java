@@ -37,6 +37,8 @@ import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.TimeSeriesAggregate;
+import org.elasticsearch.xpack.esql.plan.logical.local.EmptyLocalSupplier;
+import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -158,6 +160,65 @@ public class PromqlPlanSelectorTests extends AbstractPromqlPlanOptimizerTests {
         assertThat(as(in.value(), FieldAttribute.class).name(), equalTo("pod"));
         assertThat(in.list(), hasSize(1));
         assertThat(as(as(in.list().getFirst(), Literal.class).value(), BytesRef.class).utf8ToString(), equalTo("foo"));
+    }
+
+    /** A label matcher filters on its own label wherever the {@code __name__} matcher sits among the matchers. */
+    public void testLabelSelectorWithNameMatcherInBraces() {
+        for (String selector : List.of(
+            "network.bytes_in{pod!=\"foo\"}",
+            "{__name__=\"network.bytes_in\",pod!=\"foo\"}",
+            "{pod!=\"foo\",__name__=\"network.bytes_in\"}",
+            "{\"network.bytes_in\",pod!=\"foo\"}",
+            "{pod!=\"foo\",\"network.bytes_in\"}"
+        )) {
+            var plan = planPromql("PROMQL index=k8s step=1m avg(" + selector + ")");
+            var not = collectInnermostSelectorFilter(plan, Not.class);
+            var in = as(not.field(), In.class);
+            assertThat(selector, as(in.value(), FieldAttribute.class).name(), equalTo("pod"));
+            assertThat(selector, lastOverTimeFields(plan), equalTo(List.of("network.bytes_in")));
+        }
+    }
+
+    /**
+     * Name matchers that admit exactly one metric keep the direct read of that metric's field: the other name matchers are
+     * satisfied by it and leave no trace in the plan, so the plan is the one of the plain metric name.
+     */
+    public void testExactNameAmongNameMatchersReadsTheMetricField() {
+        for (String selector : List.of(
+            "{__name__!=\"network.bytes_out\",__name__=\"network.bytes_in\",pod=\"a\"}",
+            "{__name__=\"network.bytes_in\",__name__=~\"network\\\\..*\",pod=\"a\"}",
+            "{__name__=~\"network\\\\.bytes_in\",pod=\"a\"}"
+        )) {
+            var plan = planPromql("PROMQL index=k8s step=1m sum(" + selector + ")");
+            assertThat(selector, lastOverTimeFields(plan), equalTo(List.of("network.bytes_in")));
+            var equals = collectInnermostSelectorFilter(plan, Equals.class);
+            assertThat(selector, as(equals.left(), FieldAttribute.class).name(), equalTo("pod"));
+            assertThat(
+                selector,
+                collectSelectorFilters(plan).stream().anyMatch(f -> f.condition().anyMatch(e -> e instanceof RLike)),
+                equalTo(false)
+            );
+        }
+    }
+
+    /** Name matchers that admit no common metric select no series, like a metric that does not exist. */
+    public void testContradictoryNameMatchersSelectNothing() {
+        for (String selector : List.of(
+            "{__name__=\"network.bytes_in\",__name__!=\"network.bytes_in\"}",
+            "{__name__=\"network.bytes_in\",__name__=\"network.bytes_out\"}",
+            "{\"network.bytes_in\",\"network.bytes_out\"}",
+            "{__name__=\"network.bytes_in\",__name__!~\"network.*\",pod=\"a\"}"
+        )) {
+            for (String query : List.of(
+                selector,
+                "avg(" + selector + ")",
+                "sum by (pod) (" + selector + ")",
+                "max_over_time(" + selector + "[5m])"
+            )) {
+                var plan = planPromql("PROMQL index=k8s step=1m " + query);
+                assertThat(query, as(plan, LocalRelation.class).supplier(), equalTo(EmptyLocalSupplier.EMPTY));
+            }
+        }
     }
 
     public void testLabelSelectorRegexNegation() {
@@ -371,6 +432,10 @@ public class PromqlPlanSelectorTests extends AbstractPromqlPlanOptimizerTests {
             .flatMap(tsa -> tsa.aggregates().stream())
             .flatMap(ne -> ne.collect(LastOverTime.class).stream())
             .toList();
+    }
+
+    private static List<String> lastOverTimeFields(LogicalPlan plan) {
+        return collectInnerLastOverTimes(plan).stream().map(lot -> as(lot.field(), FieldAttribute.class).name()).toList();
     }
 
     private static List<Filter> collectSelectorFilters(LogicalPlan plan) {

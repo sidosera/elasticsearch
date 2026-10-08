@@ -40,7 +40,7 @@ ExchangeSinkExec[[_tsid{m}#0, step{r}#1, $$LASTOVERTIME_$0$timestamps{r}#2, $$LA
                     "boost" : 0.0
                   }
                 },
-                "source" : "network.bytes_in{cluster!=\"qa\",pod!=\"two\"}@1:48"
+                "source" : "cluster!=\"qa\"@1:65"
               }
             }
           ],
@@ -81,7 +81,7 @@ ExchangeSinkExec[[_tsid{m}#0, step{r}#1, $$LASTOVERTIME_$0$timestamps{r}#2, $$LA
                     "boost" : 0.0
                   }
                 },
-                "source" : "network.bytes_in{cluster!=\"qa\",pod!=\"two\"}@1:48"
+                "source" : "pod!=\"two\"@1:79"
               }
             }
           ],

@@ -50,7 +50,7 @@ ProjectExec[[parts.domain{r}#0, parts.fragment{r}#1, parts.path{r}#2, parts.exte
                     "boost" : 0.0
                   }
                 },
-                "source" : "network.bytes_in{cluster!=\"qa\",pod!=\"two\"}@1:48"
+                "source" : "cluster!=\"qa\"@1:65"
               }
             }
           ],
@@ -91,7 +91,7 @@ ProjectExec[[parts.domain{r}#0, parts.fragment{r}#1, parts.path{r}#2, parts.exte
                     "boost" : 0.0
                   }
                 },
-                "source" : "network.bytes_in{cluster!=\"qa\",pod!=\"two\"}@1:48"
+                "source" : "pod!=\"two\"@1:79"
               }
             }
           ],

@@ -93,6 +93,37 @@ public class PromqlVerifierTests extends ESTestCase {
         );
     }
 
+    /**
+     * Until metrics can be selected by a general name constraint, a selector must reduce its {@code __name__} matchers to one
+     * metric (or to none): a negative matcher's value or a pattern is never read as the metric to select.
+     */
+    public void testPromqlNameMatchersWithoutExactNameAreRejected() {
+        tsdb.error(
+            "PROMQL index=test step=5m {__name__!=\"network.bytes_in\", pod=\"a\"}",
+            containsString("negative label selectors on __name__ are not supported at this time")
+        );
+        tsdb.error(
+            "PROMQL index=test step=5m sum({__name__!~\"network.bytes_in\", pod=\"a\"})",
+            containsString("regex label selectors on __name__ are not supported at this time")
+        );
+        tsdb.error(
+            "PROMQL index=test step=5m {__name__=~\"network\\\\..*\", __name__!=\"network.bytes_in\"}",
+            containsString("regex label selectors on __name__ are not supported at this time")
+        );
+    }
+
+    /** Name matchers that reduce to one metric, or to none, need no general metric selection. */
+    public void testPromqlNameMatchersWithExactOrNoNameAreAccepted() {
+        for (String selector : List.of(
+            "{__name__!=\"network.bytes_out\", __name__=\"network.bytes_in\"}",
+            "{__name__=\"network.bytes_in\", __name__=~\"network\\\\..*\"}",
+            "{__name__=\"network.bytes_in\", __name__!=\"network.bytes_in\"}",
+            "{\"network.bytes_in\", \"network.bytes_out\"}"
+        )) {
+            assertTrue(selector, tsdb.query("PROMQL index=test step=5m sum(" + selector + ")").resolved());
+        }
+    }
+
     public void testPromqlSubquery() {
         tsdb.error(
             "PROMQL index=test step=5m (avg(rate(network.bytes_in[5m:])))",

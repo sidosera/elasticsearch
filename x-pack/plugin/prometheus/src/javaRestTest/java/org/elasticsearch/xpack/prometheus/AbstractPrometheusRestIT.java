@@ -516,6 +516,20 @@ public abstract class AbstractPrometheusRestIT extends ESRestTestCase {
         ingestTestData(mixedPayload, at);
     }
 
+    /** Ingests the tx/rx fixture at a point in time. */
+    @FunctionalInterface
+    protected interface TxRxIngestion {
+        void ingest(Instant at) throws IOException;
+    }
+
+    /**
+     * Every way the tx/rx fixture can be ingested: remote-write only, bulk only, and both mixed in one data stream. Callers
+     * wipe the default stream between them.
+     */
+    protected List<TxRxIngestion> allIngestionPaths() {
+        return List.of(this::ingestTestDataUsingRemoteWrite, this::ingestTestDataUsingBulk, this::ingestTestDataUsingRemoteWriteAndBulk);
+    }
+
     private static RemoteWrite.TimeSeries remoteWriteSeries(String metric, String host, double value, Instant at) {
         return RemoteWrite.TimeSeries.newBuilder()
             .addLabels(label("__name__", metric))

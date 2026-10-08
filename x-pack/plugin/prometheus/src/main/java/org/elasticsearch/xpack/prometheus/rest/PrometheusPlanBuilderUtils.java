@@ -31,6 +31,8 @@ import org.elasticsearch.xpack.esql.plan.logical.UnresolvedRelation;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.InstantSelector;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatchers;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelPredicate;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.MetricNameMatchers;
 
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -156,72 +158,80 @@ final class PrometheusPlanBuilderUtils {
      * — this is a known limitation of the current plan shape for that endpoint.
      */
     static Expression buildPreInfoSelectorConditionWithNameFallback(InstantSelector selector) {
-        var matchers = selector.labelMatchers().matchers();
-        List<Expression> conditions = new ArrayList<>(matchers.size());
-
-        for (var matcher : matchers) {
-            if (LabelMatcher.NAME.equals(matcher.name())) {
-                if (matcher.matcher() == LabelMatcher.Matcher.EQ) {
-                    // Parser guarantees that "__name__" equality is represented by a non-null series.
-                    assert selector.series() != null : "EQ __name__ matcher should always have a non-null series";
-                    conditions.add(new IsNotNull(Source.EMPTY, selector.series()));
-                } else if (matcher.matchesAll() == false) {
-                    // Non-equality "__name__" matchers (e.g. {__name__!="foo"}, {__name__=~"bar"}) cannot use
-                    // selector.series(). Use the "__name__" label; series without it are excluded.
+        List<Expression> conditions = new ArrayList<>();
+        Expression metricName = exactOrEmptyMetricNameCondition(selector);
+        if (metricName != null) {
+            conditions.add(metricName);
+        } else {
+            for (LabelMatcher matcher : selector.metricName().matchers()) {
+                // A matcher that accepts every metric name adds no useful filter.
+                if (matcher.matchesAll() == false) {
+                    // Without one exact name there is no metric field to test (e.g. {__name__!="foo"}, {__name__=~"bar"}).
+                    // Use the "__name__" label; series without it are excluded.
                     Expression nameField = new UnresolvedAttribute(Source.EMPTY, LabelMatcher.NAME);
                     Expression matcherCond = LabelMatchers.condition(Source.EMPTY, nameField, matcher);
-                    if (matcherCond != null) {
-                        conditions.add(combineAnd(List.of(new IsNotNull(Source.EMPTY, nameField), matcherCond)));
-                    }
+                    conditions.add(combineAnd(List.of(new IsNotNull(Source.EMPTY, nameField), matcherCond)));
                 }
-                // A matcher that accepts every metric name adds no useful filter.
-                continue;
-            }
-
-            // Regular label matcher, e.g. job="myjob".
-            Expression labelField = new UnresolvedAttribute(Source.EMPTY, matcher.name());
-            Expression cond = LabelMatchers.condition(Source.EMPTY, labelField, matcher);
-            if (cond != null) {
-                conditions.add(cond);
             }
         }
-
+        conditions.addAll(labelConditions(selector));
         return conditions.isEmpty() ? null : combineAnd(conditions);
     }
 
     /**
-     * Converts an InstantSelector's LabelMatchers into a single AND expression for pre-info filtering.
+     * Converts an InstantSelector's matchers into a single AND expression for pre-info filtering.
      * Returns {@code null} if all matchers are handled post-info or match everything.
      *
-     * <p>Special handling for {@code __name__}:
+     * <p>The {@code __name__} matchers are resolved together (see {@link MetricNameMatchers}):
      * <ul>
-     *   <li>EQ (e.g. {@code {__name__="up"}}): emits {@code IsNotNull(series)} — checks the metric
+     *   <li>One metric name (e.g. {@code {__name__="up"}}): emits {@code IsNotNull(series)} — checks the metric
      *       field itself exists, which works for both Prometheus ({@code labels.__name__} present) and
-     *       OTel (field named "up" exists). The parser always provides a non-null {@code series()} for
-     *       EQ.</li>
-     *   <li>NEQ / REG / NREG: adds a nullable {@code labels.__name__} pre-filter hint and also
-     *       evaluates post-info against {@link #METRIC_NAME_FIELD}.</li>
+     *       OTel (field named "up" exists).</li>
+     *   <li>No metric name (e.g. {@code {__name__="up", __name__!="up"}}): emits {@code false}.</li>
+     *   <li>Otherwise: adds a nullable {@code labels.__name__} pre-filter hint for each NEQ / REG / NREG matcher
+     *       and also evaluates it post-info against {@link #METRIC_NAME_FIELD}.</li>
      * </ul>
      */
     static Expression buildPreInfoSelectorCondition(InstantSelector selector) {
         List<Expression> conditions = new ArrayList<>();
-        for (LabelMatcher matcher : selector.labelMatchers().matchers()) {
-            if (LabelMatcher.NAME.equals(matcher.name())) {
-                if (matcher.matcher() == LabelMatcher.Matcher.EQ) {
-                    // Parser contract: EQ __name__ always carries a non-null series expression
-                    assert selector.series() != null : "EQ __name__ matcher should always have a non-null series";
-                    conditions.add(new IsNotNull(Source.EMPTY, selector.series()));
-                } else if (matcher.matchesAll() == false) {
+        Expression metricName = exactOrEmptyMetricNameCondition(selector);
+        if (metricName != null) {
+            conditions.add(metricName);
+        } else {
+            for (LabelMatcher matcher : selector.metricName().matchers()) {
+                if (matcher.matchesAll() == false) {
                     conditions.add(buildNullableNameHint(matcher));
-                }
-            } else {
-                Expression cond = LabelMatchers.condition(Source.EMPTY, new UnresolvedAttribute(Source.EMPTY, matcher.name()), matcher);
-                if (cond != null) {
-                    conditions.add(cond);
                 }
             }
         }
+        conditions.addAll(labelConditions(selector));
         return conditions.isEmpty() ? null : combineAnd(conditions);
+    }
+
+    /**
+     * The metric name condition when the {@code __name__} matchers reduce to one metric or to none: the metric field exists,
+     * or {@code false}. Null when they constrain the name without naming a metric.
+     */
+    private static Expression exactOrEmptyMetricNameCondition(InstantSelector selector) {
+        return switch (selector.metricName().selection()) {
+            case EXACT -> {
+                // Parser contract: a selector naming exactly one metric carries that metric's field
+                assert selector.series() != null : "a selector naming exactly one metric should always have a non-null series";
+                yield new IsNotNull(Source.EMPTY, selector.series());
+            }
+            case EMPTY -> Literal.fromBoolean(Source.EMPTY, false);
+            case GENERAL -> null;
+        };
+    }
+
+    /** Each regular label matcher, e.g. job="myjob", over its own label. */
+    private static List<Expression> labelConditions(InstantSelector selector) {
+        List<Expression> conditions = new ArrayList<>(selector.labelPredicates().size());
+        for (LabelPredicate predicate : selector.labelPredicates()) {
+            LabelMatcher matcher = predicate.matcher();
+            conditions.add(LabelMatchers.condition(Source.EMPTY, new UnresolvedAttribute(Source.EMPTY, matcher.name()), matcher));
+        }
+        return conditions;
     }
 
     private static Expression buildNullableNameHint(LabelMatcher matcher) {
@@ -231,8 +241,9 @@ final class PrometheusPlanBuilderUtils {
     }
 
     /**
-     * Converts an InstantSelector's non-exact {@code __name__} matchers into a single AND expression
-     * evaluated against {@link #METRIC_NAME_FIELD}. Returns {@code null} if no such matchers exist.
+     * Converts an InstantSelector's {@code __name__} matchers into a single AND expression
+     * evaluated against {@link #METRIC_NAME_FIELD}. Returns {@code null} if no such matchers apply, which includes
+     * matchers reducing to one metric name or to none: the pre-info condition handles those.
      *
      * <p>No {@code IsNotNull} wrapper is added: {@link LabelMatchers#condition}
      * already handles the null/empty-string case by emitting {@code IsNull(field) OR NOT(matcher)}
@@ -241,12 +252,14 @@ final class PrometheusPlanBuilderUtils {
      * {@code metric_name} is null.
      */
     static Expression buildPostInfoSelectorCondition(InstantSelector selector) {
+        if (selector.metricName().selection() != MetricNameMatchers.Selection.GENERAL) {
+            return null;
+        }
         List<Expression> conditions = new ArrayList<>();
         Expression metricNameField = new UnresolvedAttribute(Source.EMPTY, METRIC_NAME_FIELD);
-        for (LabelMatcher matcher : selector.labelMatchers().matchers()) {
-            if (LabelMatcher.NAME.equals(matcher.name()) && matcher.matcher() != LabelMatcher.Matcher.EQ && matcher.matchesAll() == false) {
-                Expression matcherCond = translateMetricNameMatcher(metricNameField, matcher);
-                conditions.add(matcherCond);
+        for (LabelMatcher matcher : selector.metricName().matchers()) {
+            if (matcher.matchesAll() == false) {
+                conditions.add(translateMetricNameMatcher(metricNameField, matcher));
             }
         }
         return conditions.isEmpty() ? null : combineAnd(conditions);
@@ -258,7 +271,7 @@ final class PrometheusPlanBuilderUtils {
         return switch (matcher.matcher()) {
             case REG -> combineOr(List.of(rawMetricNameCondition, prefixedMetricNameCondition));
             case NEQ, NREG -> combineAnd(List.of(rawMetricNameCondition, prefixedMetricNameCondition));
-            case EQ -> throw new IllegalArgumentException("exact __name__ matchers are handled before info nodes");
+            case EQ -> combineOr(List.of(rawMetricNameCondition, prefixedMetricNameCondition));
         };
     }
 
