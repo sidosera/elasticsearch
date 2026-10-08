@@ -43,6 +43,7 @@ import org.elasticsearch.xpack.esql.plan.logical.Eval;
 import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.MergePlan;
+import org.elasticsearch.xpack.esql.plan.logical.MetricSamples;
 import org.elasticsearch.xpack.esql.plan.logical.PackDims;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.TimeSeriesAggregate;
@@ -55,6 +56,7 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryCom
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryOperator;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinarySet;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LiteralSelector;
 import org.elasticsearch.xpack.esql.session.Configuration;
 
@@ -365,8 +367,16 @@ public record TranslationContext(
         // preserves per-series granularity while making the full schema available to the surrounding query.
         var groupKeys = new ArrayList<NamedExpression>();
         var outKeys = new ArrayList<NamedExpression>();
+        // Samples of metrics selected by name carry their metric name as a column of its own, so no packing repeats a
+        // stored __name__ label.
+        boolean metricNameColumn = schema.labels().contains(LabelMatcher.NAME) && plan.anyMatch(p -> p instanceof MetricSamples);
         for (Set<String> skip : finestFirst(schema.skips())) {
-            List<Expression> excluded = skip.stream().<Expression>map(label -> {
+            Set<String> excludedLabels = skip;
+            if (metricNameColumn && skip.contains(LabelMatcher.NAME) == false) {
+                excludedLabels = new TreeSet<>(skip);
+                excludedLabels.add(LabelMatcher.NAME);
+            }
+            List<Expression> excluded = excludedLabels.stream().<Expression>map(label -> {
                 Attribute resolved = find(plan.output(), label);
                 return resolved != null ? resolved : mapToRef(label);
             }).toList();

@@ -11,6 +11,7 @@ import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.logging.HeaderWarning;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
@@ -27,6 +28,7 @@ import org.elasticsearch.compute.lucene.query.LuceneSourceOperator;
 import org.elasticsearch.compute.lucene.query.LuceneTopNSourceOperator;
 import org.elasticsearch.compute.lucene.query.MinCompetitiveQuery;
 import org.elasticsearch.compute.lucene.query.TimeSeriesSourceOperator;
+import org.elasticsearch.compute.lucene.read.MetricSamplesOperator;
 import org.elasticsearch.compute.lucene.read.ReadDimsOperator;
 import org.elasticsearch.compute.lucene.read.ValuesSourceReaderOperator;
 import org.elasticsearch.compute.operator.DriverContext;
@@ -47,6 +49,8 @@ import org.elasticsearch.index.mapper.MappedFieldType;
 import org.elasticsearch.index.mapper.MappingLookup;
 import org.elasticsearch.index.mapper.MetadataFieldMapper;
 import org.elasticsearch.index.mapper.NestedLookup;
+import org.elasticsearch.index.mapper.ObjectMapper;
+import org.elasticsearch.index.mapper.PassThroughObjectMapper;
 import org.elasticsearch.index.mapper.SourceFieldMapper;
 import org.elasticsearch.index.mapper.SourceLoader;
 import org.elasticsearch.index.mapper.blockloader.BlockLoaderFunctionConfig;
@@ -76,6 +80,7 @@ import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.core.expression.TemporalityAttribute;
 import org.elasticsearch.xpack.esql.core.expression.TimeSeriesMetadataAttribute;
+import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.CompactMultiTypeEsField;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.core.type.FunctionEsField;
@@ -87,10 +92,12 @@ import org.elasticsearch.xpack.esql.expression.function.blockloader.BlockLoaderE
 import org.elasticsearch.xpack.esql.expression.function.scalar.EsqlScalarFunction;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.AbstractConvertFunction;
 import org.elasticsearch.xpack.esql.plan.logical.UnmappedFieldsAttribute;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.MetricNameMatchers;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec.Sort;
 import org.elasticsearch.xpack.esql.plan.physical.EstimatesRowSize;
 import org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec;
+import org.elasticsearch.xpack.esql.plan.physical.MetricSamplesExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.ReadDimsExec;
 import org.elasticsearch.xpack.esql.plan.physical.TimeSeriesAggregateExec;
@@ -103,8 +110,11 @@ import org.elasticsearch.xpack.esql.type.EsqlDataTypeRegistry;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
@@ -291,6 +301,135 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
             layout.append(attr);
         }
         return source.with(new ReadDimsOperator.Factory(valuesSourceReader, docChannel, tsidChannel), layout.build());
+    }
+
+    /**
+     * How many selected metrics a {@link MetricSamplesOperator} loads at once. Each loads one block per metric over the whole
+     * input page, so this bounds the memory of reading many metrics without bounding how many can be selected.
+     */
+    static final int METRIC_SAMPLES_CHUNK_SIZE = 16;
+
+    @Override
+    public PhysicalOperation metricSamplesPhysicalOperation(
+        MetricSamplesExec metricSamplesExec,
+        PhysicalOperation source,
+        LocalExecutionPlannerContext context
+    ) {
+        int docChannel = source.layout.get(metricSamplesExec.docAttribute().id()).channel();
+        int tsidChannel = source.layout.get(metricSamplesExec.tsid().id()).channel();
+        IndexedByShardId<ValuesSourceReaderOperator.ShardContext> readers = shardContexts.map(
+            s -> new ValuesSourceReaderOperator.ShardContext(
+                s.searcher().getIndexReader(),
+                s::newSourceLoader,
+                s.storedFieldsSequentialProportion()
+            )
+        );
+        Layout layout = source.layout.builder()
+            .append(metricSamplesExec.seriesId())
+            .append(metricSamplesExec.name())
+            .append(metricSamplesExec.value())
+            .build();
+        return source.with(
+            new MetricSamplesOperator.Factory(
+                selectMetrics(metricSamplesExec.metricName()),
+                METRIC_SAMPLES_CHUNK_SIZE,
+                plannerSettings.valuesLoadingJumboSize(),
+                readers,
+                docChannel,
+                tsidChannel,
+                plannerSettings.sourceReservationFactor(),
+                directoryBytesRead
+            ),
+            layout
+        );
+    }
+
+    /**
+     * The metric fields any local shard selects. A shard selects a mapped metric when the name it exposes the metric under
+     * satisfies every matcher; fields the shard does not let this request see are never selected. A metric is read with one
+     * loader per element type, and each shard reads it only where it selects it, under its own name for it.
+     */
+    private List<MetricSamplesOperator.Metric> selectMetrics(MetricNameMatchers metricName) {
+        record Slot(String field, DataType type) {}
+        Map<Slot, Map<Integer, BytesRef>> namesByShard = new LinkedHashMap<>();
+        for (ShardContext shard : shardContexts.iterable()) {
+            MappingLookup mappingLookup = shard.mappingLookup();
+            List<PassThroughObjectMapper> passThroughs = new ArrayList<>();
+            for (ObjectMapper objectMapper : mappingLookup.objectMappers().values()) {
+                if (objectMapper instanceof PassThroughObjectMapper passThrough) {
+                    passThroughs.add(passThrough);
+                }
+            }
+            for (String field : mappingLookup.metricFieldMappers().keySet()) {
+                MappedFieldType fieldType = shard.fieldType(field);
+                if (fieldType == null || fieldType.getMetricType() == null || shard.isExtractableMappedField(field) == false) {
+                    continue;
+                }
+                String name = exposedMetricName(shard, passThroughs, field);
+                if (metricName.admits(name) == false) {
+                    continue;
+                }
+                DataType type = EsqlDataTypeRegistry.INSTANCE.fromEs(fieldType.familyTypeName(), fieldType.getMetricType());
+                if (type.noCounter().isNumeric() == false || type.noCounter() == DataType.UNSIGNED_LONG) {
+                    throw new IllegalArgumentException(
+                        "metric ["
+                            + name
+                            + "] of type ["
+                            + fieldType.typeName()
+                            + "] matches the __name__ matchers but only numeric metrics can be selected by name"
+                    );
+                }
+                namesByShard.computeIfAbsent(new Slot(field, type.noCounter()), k -> new HashMap<>())
+                    .put(shard.index(), new BytesRef(name));
+            }
+        }
+        List<MetricSamplesOperator.Metric> metrics = new ArrayList<>(namesByShard.size());
+        for (Map.Entry<Slot, Map<Integer, BytesRef>> e : namesByShard.entrySet()) {
+            String field = e.getKey().field();
+            Map<Integer, BytesRef> names = e.getValue();
+            ValuesSourceReaderOperator.BuildLoader buildLoader = (driverContext, shardId) -> {
+                if (names.containsKey(shardId) == false) {
+                    return ValuesSourceReaderOperator.LOAD_CONSTANT_NULLS;
+                }
+                ShardContext shard = shardContexts.get(shardId);
+                return ValuesSourceReaderOperator.load(
+                    shard.blockLoader(
+                        field,
+                        false,
+                        MappedFieldType.FieldExtractPreference.NONE,
+                        null,
+                        new BlockLoaderWarnings(driverContext, Source.EMPTY),
+                        plannerSettings.blockLoaderSizeOrdinals(),
+                        plannerSettings.blockLoaderSizeScript()
+                    )
+                );
+            };
+            metrics.add(
+                new MetricSamplesOperator.Metric(
+                    new ValuesSourceReaderOperator.FieldInfo(field, PlannerUtils.toElementType(e.getKey().type()), false, buildLoader),
+                    names::get
+                )
+            );
+        }
+        return metrics;
+    }
+
+    /**
+     * The name a shard exposes a metric field under: the name an exact metric name in a query resolves to it. That is the
+     * short name of a field under a passthrough object when the short name resolves to that very field, and its full path
+     * otherwise - for instance when a label of higher passthrough priority takes the short name.
+     */
+    static String exposedMetricName(ShardContext shard, List<PassThroughObjectMapper> passThroughs, String field) {
+        for (PassThroughObjectMapper passThrough : passThroughs) {
+            if (field.startsWith(passThrough.fullPath() + ".")) {
+                String shortName = field.substring(passThrough.fullPath().length() + 1);
+                MappedFieldType resolved = shard.fieldType(shortName);
+                if (resolved != null && resolved.name().equals(field)) {
+                    return shortName;
+                }
+            }
+        }
+        return field;
     }
 
     private static String getFieldName(Attribute attr) {

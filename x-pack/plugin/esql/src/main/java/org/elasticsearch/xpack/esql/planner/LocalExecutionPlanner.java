@@ -205,6 +205,7 @@ import org.elasticsearch.xpack.esql.plan.physical.LimitExec;
 import org.elasticsearch.xpack.esql.plan.physical.LocalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.LookupJoinExec;
 import org.elasticsearch.xpack.esql.plan.physical.MMRExec;
+import org.elasticsearch.xpack.esql.plan.physical.MetricSamplesExec;
 import org.elasticsearch.xpack.esql.plan.physical.MetricsInfoExec;
 import org.elasticsearch.xpack.esql.plan.physical.MvExpandExec;
 import org.elasticsearch.xpack.esql.plan.physical.OutputExec;
@@ -432,6 +433,12 @@ public class LocalExecutionPlanner {
             return planFieldExtractNode(fieldExtractExec, context);
         } else if (node instanceof ReadDimsExec readDimsExec) {
             return planReadDimsNode(readDimsExec, context);
+        } else if (node instanceof MetricSamplesExec metricSamplesExec) {
+            return physicalOperationProviders.metricSamplesPhysicalOperation(
+                metricSamplesExec,
+                plan(metricSamplesExec.child(), context),
+                context
+            );
         } else if (node instanceof PackDimsExec packDims) {
             return planPackDims(packDims, context);
         } else if (node instanceof UnpackDimsExec unpackDims) {

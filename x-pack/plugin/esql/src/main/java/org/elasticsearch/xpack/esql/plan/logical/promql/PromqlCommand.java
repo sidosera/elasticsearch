@@ -10,6 +10,7 @@ package org.elasticsearch.xpack.esql.plan.logical.promql;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
 import org.elasticsearch.xpack.esql.capabilities.TelemetryAware;
+import org.elasticsearch.xpack.esql.common.Failure;
 import org.elasticsearch.xpack.esql.common.Failures;
 import org.elasticsearch.xpack.esql.core.QlIllegalArgumentException;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
@@ -39,7 +40,6 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinarySet
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LiteralSelector;
-import org.elasticsearch.xpack.esql.plan.logical.promql.selector.MetricNameMatchers;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.RangeSelector;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.Selector;
 
@@ -448,11 +448,6 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
         p.forEachDown(lp -> {
             switch (lp) {
                 case Selector s -> {
-                    if (s instanceof LiteralSelector == false && s.metricName().selection() == MetricNameMatchers.Selection.GENERAL) {
-                        // TODO: Select metrics by a general name constraint instead of reading the one metric it names.
-                        // https://github.com/elastic/elasticsearch/issues/146977
-                        failures.add(fail(s, unsupportedNameSelector(s), s.sourceText()));
-                    }
                     if (s.evaluation() != null) {
                         // Only constant per-selector time shift is supported at the moment.
                         // TODO(sidosera): Support heterogeneous offset on binary operators.
@@ -612,21 +607,67 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
         });
 
         verifyMetadataManipulationPlacement(p, null, failures);
+        verifySelectionByMetricName(p, failures);
     }
 
     /**
-     * The failure for a selector whose metric name constraints do not reduce to one metric or to none: only an exact metric
-     * name has a metric field to read.
+     * A selector without an exact metric name reads the samples of every metric it selects through a reader of its own,
+     * keeping each metric a separate series. Operators that would combine those samples with another source-backed operand
+     * in one aggregation, or that rely on series shapes the reader does not produce yet, reject it.
      */
-    private static String unsupportedNameSelector(Selector selector) {
-        List<LabelMatcher> matchers = selector.metricName().matchers();
-        if (matchers.isEmpty()) {
-            return "__name__ label selector is required at this time [{}]";
-        }
-        if (matchers.stream().anyMatch(m -> m.matcher().isRegex())) {
-            return "regex label selectors on __name__ are not supported at this time [{}]";
-        }
-        return "negative label selectors on __name__ are not supported at this time [{}]";
+    private static void verifySelectionByMetricName(LogicalPlan plan, Failures failures) {
+        plan.forEachDown(lp -> {
+            switch (lp) {
+                case VectorBinaryOperator op when op instanceof VectorBinarySet == false
+                    && (Selector.selectsMetricsByName(op.left()) || Selector.selectsMetricsByName(op.right()))
+                    && hasSourceBackedExpression(op.left())
+                    && hasSourceBackedExpression(op.right()) -> failures.add(
+                        fail(
+                            op,
+                            "binary expressions with a selector that does not name exactly one metric are not supported at this time [{}]",
+                            op.sourceText()
+                        )
+                    );
+                case VectorBinarySet set when carriesMetricNameColumn(set.left()) != carriesMetricNameColumn(set.right()) -> failures.add(
+                    fail(
+                        set,
+                        "set operator [{}] between a selector that does not name exactly one metric and one that does is not "
+                            + "supported at this time [{}]",
+                        set.op().keyword(),
+                        set.sourceText()
+                    )
+                );
+                case HistogramFunctionCall histogram when Selector.selectsMetricsByName(histogram.child()) -> failures.add(
+                    unsupportedOverMetricsByName(histogram)
+                );
+                case MetadataManipulationFunction relabel when Selector.selectsMetricsByName(relabel.child()) -> failures.add(
+                    unsupportedOverMetricsByName(relabel)
+                );
+                case AcrossSeriesReduction reduction when Selector.selectsMetricsByName(reduction.child()) -> failures.add(
+                    unsupportedOverMetricsByName(reduction)
+                );
+                default -> {
+                }
+            }
+        });
+    }
+
+    private static Failure unsupportedOverMetricsByName(PromqlFunctionCall function) {
+        return fail(
+            function,
+            "[{}] over a selector that does not name exactly one metric is not supported at this time [{}]",
+            function.definition().name(),
+            function.sourceText()
+        );
+    }
+
+    /**
+     * Whether the series of {@code plan} carry the name of their metric as a column of their own: the series of metrics selected
+     * by name, until an aggregation drops the name. Other series keep any stored name among their packed labels, so the two
+     * kinds cannot be deduplicated against each other.
+     */
+    private static boolean carriesMetricNameColumn(LogicalPlan plan) {
+        return plan.output().stream().anyMatch(a -> a instanceof ReferenceAttribute && LabelMatcher.NAME.equals(a.name()));
     }
 
     /**

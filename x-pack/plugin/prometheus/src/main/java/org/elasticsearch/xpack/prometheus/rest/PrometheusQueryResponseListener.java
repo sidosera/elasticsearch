@@ -293,30 +293,46 @@ class PrometheusQueryResponseListener implements ActionListener<EsqlQueryRespons
                 seriesJson = val.utf8ToString();
             }
             writeMetricFromSeriesJson(builder, seriesJson);
+            // labels kept apart from the packed series, such as the name of a metric selected by a __name__ pattern
+            writeLabelColumns(builder, page, position, DIMENSION_COL_START_IDX + 1, stepColIdx, columns, zoneId, scratch);
         } else {
-            for (int i = DIMENSION_COL_START_IDX; i < stepColIdx; i++) {
-                Block labelBlock = page.getBlock(i);
-                // Omit null labels (e.g. a null-filled missing BY label) and empty ones (a label function that emptied a
-                // label): Prometheus treats a label with an empty value as absent. This mirrors writeMetricFields on the
-                // _timeseries path.
-                if (labelBlock.isNull(position)) {
-                    continue;
-                }
-                DataType type = columns.get(i).type();
-                if (type == DataType.KEYWORD || type == DataType.TEXT) {
-                    BytesRef val = ((BytesRefBlock) labelBlock).getBytesRef(labelBlock.getFirstValueIndex(position), scratch);
-                    if (val.length == 0) {
-                        continue;
-                    }
-                    builder.field(columns.get(i).name());
-                    builder.utf8Value(val.bytes, val.offset, val.length);
+            writeLabelColumns(builder, page, position, DIMENSION_COL_START_IDX, stepColIdx, columns, zoneId, scratch);
+        }
+        builder.endObject(); // metric
+    }
+
+    /** Writes the single-valued label columns {@code [from, to)} of the row at {@code position}. */
+    private static void writeLabelColumns(
+        XContentBuilder builder,
+        Page page,
+        int position,
+        int from,
+        int to,
+        List<ColumnInfoImpl> columns,
+        ZoneId zoneId,
+        BytesRef scratch
+    ) throws IOException {
+        for (int i = from; i < to; i++) {
+            Block labelBlock = page.getBlock(i);
+            // Omit null labels (e.g. a null-filled missing BY label) and empty ones (a label function that emptied a
+            // label): Prometheus treats a label with an empty value as absent. This mirrors writeMetricFields on the
+            // _timeseries path.
+            if (labelBlock.isNull(position)) {
+                continue;
+            }
+            DataType type = columns.get(i).type();
+            if (type == DataType.KEYWORD || type == DataType.TEXT) {
+                BytesRef val = ((BytesRefBlock) labelBlock).getBytesRef(labelBlock.getFirstValueIndex(position), scratch);
+                if (val.length == 0) {
                     continue;
                 }
                 builder.field(columns.get(i).name());
-                writeLabelValue(builder, labelBlock, type, position, zoneId, scratch);
+                builder.utf8Value(val.bytes, val.offset, val.length);
+                continue;
             }
+            builder.field(columns.get(i).name());
+            writeLabelValue(builder, labelBlock, type, position, zoneId, scratch);
         }
-        builder.endObject(); // metric
     }
 
     /**

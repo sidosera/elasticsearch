@@ -22,6 +22,7 @@ import org.elasticsearch.xpack.esql.plan.logical.IpLocation;
 import org.elasticsearch.xpack.esql.plan.logical.Limit;
 import org.elasticsearch.xpack.esql.plan.logical.LimitBy;
 import org.elasticsearch.xpack.esql.plan.logical.Lookup;
+import org.elasticsearch.xpack.esql.plan.logical.MetricSamples;
 import org.elasticsearch.xpack.esql.plan.logical.MetricsInfo;
 import org.elasticsearch.xpack.esql.plan.logical.MvExpand;
 import org.elasticsearch.xpack.esql.plan.logical.OrderBy;
@@ -138,6 +139,7 @@ public class PlanWritables {
             UriParts.ENTRY,
             IpLocation.ENTRY,
             MetricsInfo.ENTRY,
+            MetricSamples.ENTRY,
             RegisteredDomain.ENTRY,
             TsInfo.ENTRY,
             UserAgent.ENTRY

@@ -12,6 +12,7 @@ import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.LastOverTime;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
@@ -102,7 +103,7 @@ public final class InstantSelector extends Selector {
     public List<Attribute> output() {
         if (output == null) {
             // returns values grouped per time series
-            output = List.of(FieldAttribute.timeSeriesAttribute(source()));
+            output = CollectionUtils.combine(List.of(FieldAttribute.timeSeriesAttribute(source())), metricNameOutput());
         }
         return output;
     }
@@ -115,6 +116,6 @@ public final class InstantSelector extends Selector {
     /** An instant selector maps to LastOverTime to get the latest sample per time series. */
     @Override
     public IntermediateResult translate(TranslationContext context) {
-        return translateSeries(context, new LastOverTime(source(), samples(), AggregateFunction.NO_WINDOW, context.time()));
+        return translateSeries(context, samples -> new LastOverTime(source(), samples, AggregateFunction.NO_WINDOW, context.time()));
     }
 }

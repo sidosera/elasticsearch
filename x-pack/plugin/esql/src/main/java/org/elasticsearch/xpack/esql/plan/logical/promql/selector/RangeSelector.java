@@ -109,6 +109,6 @@ public final class RangeSelector extends Selector {
     /** A range selector reads the raw samples; the enclosing function call applies the window. */
     @Override
     public IntermediateResult translate(TranslationContext context) {
-        return translateSeries(context, samples());
+        return translateSeries(context, samples -> samples);
     }
 }

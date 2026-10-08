@@ -84,6 +84,35 @@ public class PrometheusQueryResponseListenerTests extends ESTestCase {
         }
     }
 
+    // Metrics selected by a __name__ pattern keep their name in a column next to the packed _timeseries labels: both make up
+    // the series' labels.
+    public void testConvertRangeQueryWithSeriesColumnAndMetricName() throws IOException {
+        List<ColumnInfoImpl> columns = List.of(
+            col("value", "double"),
+            col("_timeseries", "keyword"),
+            col("__name__", "keyword"),
+            col("step", "long")
+        );
+        List<List<Object>> rows = List.of(
+            List.of(List.of(1.0, 2.0), "{\"labels\":{\"host\":\"a\"}}", "rx", List.of(1735689600000L, 1735689660000L)),
+            List.of(List.of(3.0, 4.0), "{\"attributes\":{\"host\":\"a\"}}", "tx", List.of(1735689600000L, 1735689660000L))
+        );
+        try (
+            XContentBuilder builder = PrometheusQueryResponseListener.convertToPrometheusJson(
+                pagesOf(rows),
+                columns,
+                ZoneOffset.UTC,
+                "matrix",
+                QueryMode.RANGE
+            )
+        ) {
+            ObjectPath path = toObjectPath(builder);
+            assertSuccessMatrix(path);
+            assertThat(path.evaluate("data.result.0.metric"), equalTo(Map.of("host", "a", "__name__", "rx")));
+            assertThat(path.evaluate("data.result.1.metric"), equalTo(Map.of("attributes.host", "a", "__name__", "tx")));
+        }
+    }
+
     // A null label value (e.g. a BY label null-filled because it was absent from a series) must be OMITTED from the
     // Prometheus `metric` object, not serialized as an empty string. PromQL distinguishes an absent label from a label
     // whose value is "". This mirrors the `_timeseries` JSON path, which only emits non-null entries.

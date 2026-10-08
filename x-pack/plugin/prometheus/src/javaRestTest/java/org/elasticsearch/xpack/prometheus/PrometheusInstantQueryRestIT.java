@@ -676,25 +676,58 @@ public class PrometheusInstantQueryRestIT extends AbstractPrometheusRestIT {
     }
 
     /**
-     * A negative or pattern {@code __name__} matcher never names the metric to read: without an exact name the selector must
-     * select metrics by name, which is not supported yet. The query is rejected rather than answered from the wrong metric.
+     * A negative or pattern {@code __name__} matcher selects every metric it accepts, never the metric its value names:
+     * {@code {__name__!="tx",host="a"}} is the rx sample of host a, whether rx was written by remote write (a document of its
+     * own, carrying a stored {@code __name__}) or by bulk (one document holding both metrics and no {@code __name__}).
      */
-    public void testInstantNameMatchersWithoutExactNameAreRejected() throws Exception {
-        ingestTestDataUsingRemoteWrite(QUERY_TIME);
-        for (var entry : Map.of(
-            "{__name__!=\"tx\",host=\"a\"}",
-            "negative label selectors on __name__ are not supported at this time",
-            "{__name__!~\"tx\",host=\"a\"}",
-            "regex label selectors on __name__ are not supported at this time",
-            "{__name__=~\"t.*\",host=\"a\"}",
-            "regex label selectors on __name__ are not supported at this time",
-            "{host=\"a\"}",
-            "__name__ label selector is required at this time"
-        ).entrySet()) {
-            ResponseException error = expectThrows(ResponseException.class, () -> executeBinopInstantQuery(entry.getKey()));
-            assertThat(entry.getKey(), error.getResponse().getStatusLine().getStatusCode(), equalTo(400));
-            assertThat(entry.getKey(), EntityUtils.toString(error.getResponse().getEntity()), containsString(entry.getValue()));
+    public void testInstantSelectsMetricsByName() throws Exception {
+        for (var ingestion : allIngestionPaths()) {
+            ingestion.ingest(QUERY_TIME);
+            assertBinopInstantValues("{__name__!=\"tx\",host=\"a\"}", 2);
+            assertBinopInstantValues("{__name__!~\"t.*\",host=\"a\"}", 2);
+            assertBinopInstantValues("{__name__=~\"tx|rx\",host=\"a\"}", 10, 2);
+            assertBinopInstantValues("{__name__=~\".+\",host=\"a\"}", 10, 2);
+            assertBinopInstantValues("{host=\"a\"}", 10, 2);
+            assertBinopInstantValues("{__name__=~\"tx|rx\",host=\"nope\"}");
+            // the samples of every selected metric aggregate together, and drop their name like any aggregation
+            assertBinopInstantValues("sum({__name__=~\"tx|rx\"})", 10 + 30 + 12 + 2 + 3 + 4);
+            assertBinopInstantGroups("sum by (host) ({__name__=~\"tx|rx\"})", "host", Map.of("a", 12.0, "b", 33.0, "c", 16.0));
+            assertBinopInstantGroups("max without (cluster) ({__name__=~\"tx|rx\"})", "host", Map.of("a", 10.0, "b", 30.0, "c", 12.0));
+            wipeDefaultStream();
         }
+    }
+
+    /**
+     * Each selected metric is a series of its own named by {@code __name__}, even when one document holds several metrics with
+     * the same labels: the series of host a are {@code tx} and {@code rx}, each named once.
+     */
+    public void testInstantMetricsSelectedByNameKeepTheirName() throws Exception {
+        for (var ingestion : allIngestionPaths()) {
+            ingestion.ingest(QUERY_TIME);
+            // parsing rejects a label written twice, such as a stored __name__ next to the selected metric's name
+            ObjectPath response = executeBinopInstantQuery("{__name__=~\"tx|rx\",host=\"a\"}");
+            List<Map<String, Object>> result = response.evaluate("data.result");
+            Map<String, String> byName = new HashMap<>();
+            for (Map<String, Object> series : result) {
+                @SuppressWarnings("unchecked")
+                Map<String, String> metric = (Map<String, String>) series.get("metric");
+                assertThat(metric.get("host"), equalTo("a"));
+                assertNull("duplicate series", byName.put(metric.get("__name__"), (String) ((List<?>) series.get("value")).get(1)));
+            }
+            assertThat(byName, equalTo(Map.of("tx", "10.0", "rx", "2.0")));
+            wipeDefaultStream();
+        }
+    }
+
+    /** Operators that would combine metrics selected by name with another source are rejected rather than answered wrongly. */
+    public void testInstantMetricsSelectedByNameInUnsupportedPositionsAreRejected() throws Exception {
+        ingestTestDataUsingRemoteWrite(QUERY_TIME);
+        ResponseException error = expectThrows(ResponseException.class, () -> executeBinopInstantQuery("{__name__=~\"tx|rx\"} / tx"));
+        assertThat(error.getResponse().getStatusLine().getStatusCode(), equalTo(400));
+        assertThat(
+            EntityUtils.toString(error.getResponse().getEntity()),
+            containsString("binary expressions with a selector that does not name exactly one metric are not supported at this time")
+        );
     }
 
     /** Prometheus converts k with an integer cast: {@code topk(1.5, tx)} keeps one series and {@code topk(0.5, tx)} none. */

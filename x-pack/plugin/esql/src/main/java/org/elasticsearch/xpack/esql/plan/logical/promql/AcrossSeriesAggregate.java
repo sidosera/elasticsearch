@@ -15,12 +15,15 @@ import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction;
 import org.elasticsearch.xpack.esql.expression.promql.function.FunctionType;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionDefinition;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionRegistry.PromqlContext;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.Selector;
 
 import java.util.HashSet;
 import java.util.List;
@@ -181,6 +184,11 @@ public final class AcrossSeriesAggregate extends PromqlFunctionCall {
     @Override
     public IntermediateResult translate(TranslationContext context) {
         List<String> keys = TranslationContext.mapFinite(groupings());
+        if (grouping() == WITHOUT && keys.contains(LabelMatcher.NAME) == false && Selector.selectsMetricsByName(child())) {
+            // Like every aggregation, without (...) drops the metric name: series of different metrics selected by name merge
+            // when their other labels agree.
+            keys = CollectionUtils.combine(keys, LabelMatcher.NAME);
+        }
         TranslationSchema childRequired = switch (grouping()) {
             case BY -> finite(keys);
             // without () keeps the child's label set; without (K) declares its own and widens every pending one by K

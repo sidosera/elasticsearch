@@ -86,33 +86,29 @@ public class PromqlVerifierTests extends ESTestCase {
         );
     }
 
-    public void testPromqlIllegalNameLabelMatcher() {
-        tsdb.error(
-            "PROMQL index=test step=5m (avg({__name__=~\"*.foo.*\"}))",
-            containsString("regex label selectors on __name__ are not supported at this time")
-        );
-    }
-
     /**
-     * Until metrics can be selected by a general name constraint, a selector must reduce its {@code __name__} matchers to one
-     * metric (or to none): a negative matcher's value or a pattern is never read as the metric to select.
+     * A selector whose {@code __name__} matchers name no single metric selects every metric they accept, by name: a negative
+     * matcher's value or a pattern is never read as the metric.
      */
-    public void testPromqlNameMatchersWithoutExactNameAreRejected() {
-        tsdb.error(
-            "PROMQL index=test step=5m {__name__!=\"network.bytes_in\", pod=\"a\"}",
-            containsString("negative label selectors on __name__ are not supported at this time")
-        );
-        tsdb.error(
-            "PROMQL index=test step=5m sum({__name__!~\"network.bytes_in\", pod=\"a\"})",
-            containsString("regex label selectors on __name__ are not supported at this time")
-        );
-        tsdb.error(
-            "PROMQL index=test step=5m {__name__=~\"network\\\\..*\", __name__!=\"network.bytes_in\"}",
-            containsString("regex label selectors on __name__ are not supported at this time")
-        );
+    public void testPromqlSelectorsWithoutExactNameAreAccepted() {
+        for (String query : List.of(
+            "{__name__=~\"network\\\\..*\"}",
+            "avg({__name__=~\"*.foo.*\"})",
+            "{__name__!=\"network.bytes_in\", pod=\"a\"}",
+            "sum by (pod) ({__name__!~\"network.bytes_in\", pod=\"a\"})",
+            "{pod=\"a\"}",
+            "max_over_time({__name__=~\"network\\\\..*\"}[5m])",
+            "sum without (pod) ({__name__=~\"network\\\\..*\"})",
+            "{__name__=~\"network\\\\..*\"} * 2",
+            "{__name__=~\"network\\\\..*\"} > 2",
+            "{__name__=~\"network\\\\..*\"} or {pod=\"a\"}",
+            "sum({__name__=~\"network\\\\..*\"}) or sum(network.bytes_in)"
+        )) {
+            assertTrue(query, tsdb.query("PROMQL index=test step=5m " + query).resolved());
+        }
     }
 
-    /** Name matchers that reduce to one metric, or to none, need no general metric selection. */
+    /** Name matchers that reduce to one metric, or to none, need no selection by name. */
     public void testPromqlNameMatchersWithExactOrNoNameAreAccepted() {
         for (String selector : List.of(
             "{__name__!=\"network.bytes_out\", __name__=\"network.bytes_in\"}",
@@ -122,6 +118,30 @@ public class PromqlVerifierTests extends ESTestCase {
         )) {
             assertTrue(selector, tsdb.query("PROMQL index=test step=5m sum(" + selector + ")").resolved());
         }
+    }
+
+    /** Operators that combine the metrics selected by name with another source, or need series shapes they lack, reject them. */
+    public void testPromqlSelectorsWithoutExactNameInUnsupportedPositions() {
+        tsdb.error(
+            "PROMQL index=test step=5m {__name__=~\"network\\\\..*\"} / network.bytes_in",
+            containsString("binary expressions with a selector that does not name exactly one metric are not supported at this time")
+        );
+        tsdb.error(
+            "PROMQL index=test step=5m sum({__name__=~\"network\\\\..*\"}) / sum(network.bytes_in)",
+            containsString("binary expressions with a selector that does not name exactly one metric are not supported at this time")
+        );
+        tsdb.error(
+            "PROMQL index=test step=5m {__name__=~\"network\\\\..*\"} or network.bytes_in",
+            containsString("set operator [or] between a selector that does not name exactly one metric and one that does is not supported")
+        );
+        tsdb.error(
+            "PROMQL index=test step=5m topk(2, {__name__=~\"network\\\\..*\"})",
+            containsString("[topk] over a selector that does not name exactly one metric is not supported at this time")
+        );
+        tsdb.error(
+            "PROMQL index=test step=5m sum by (dst) (label_replace({__name__=~\"network\\\\..*\"}, \"dst\", \"$1\", \"pod\", \"(.*)\"))",
+            containsString("[label_replace] over a selector that does not name exactly one metric is not supported at this time")
+        );
     }
 
     public void testPromqlSubquery() {
@@ -433,13 +453,6 @@ public class PromqlVerifierTests extends ESTestCase {
                 "1:27: argument of [sum(metricset)] must be [aggregate_metric_double, exponential_histogram, tdigest "
                     + "or numeric except unsigned_long or counter types], found value [metricset] type [keyword]"
             )
-        );
-    }
-
-    public void testNoMetricNameMatcherNotSupported() {
-        tsdb.error(
-            "PROMQL index=test step=5m {foo=\"bar\"}",
-            containsString("__name__ label selector is required at this time [{foo=\"bar\"}]")
         );
     }
 

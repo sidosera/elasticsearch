@@ -42,6 +42,7 @@ import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
 import org.elasticsearch.xpack.esql.plan.logical.BinaryPlan;
 import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.logical.MetricSamples;
 import org.elasticsearch.xpack.esql.plan.logical.PackDims;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.TimeSeriesAggregate;
@@ -193,6 +194,14 @@ public final class TranslateTimeSeriesAggregate extends AnalyzerRules.Parameteri
         if (tsid.get() == null) {
             tsid.set(new MetadataAttribute(aggregate.source(), MetadataAttribute.TSID_FIELD, DataType.TSID_DATA_TYPE, false));
         }
+        // Samples of metrics selected by name are series of their own: group them by their series identity, while the source
+        // still provides the _tsid the samples extend.
+        MetricSamples metricSamples = findMetricSamples(aggregate.child());
+        Attribute sourceTsid = tsid.get();
+        if (metricSamples != null) {
+            tsid.set(metricSamples.seriesId());
+            sourceTsid = metricSamples.tsid();
+        }
         Map<AggregateFunction, Alias> timeSeriesAggs = new HashMap<>();
         List<NamedExpression> firstPassAggs = new ArrayList<>();
         List<NamedExpression> secondPassAggs = new ArrayList<>();
@@ -337,7 +346,7 @@ public final class TranslateTimeSeriesAggregate extends AnalyzerRules.Parameteri
         }
         // Inject _tsid (and adjust the index mode) only into the time-series source of this aggregate, again
         // without descending into nested sub-plans on the right-hand side of a join - see addTsidToTimeSeriesSource.
-        LogicalPlan newChild = addTsidToTimeSeriesSource(aggregate.child(), tsid.get(), requiredTimeSeriesSource.get());
+        LogicalPlan newChild = addTsidToTimeSeriesSource(aggregate.child(), sourceTsid, requiredTimeSeriesSource.get());
         Bucket userBucket = timeBucketSpecRef.get();
         if (userBucket == null) {
             userBucket = (Bucket) Alias.unwrap(timeBucket);
@@ -563,6 +572,26 @@ public final class TranslateTimeSeriesAggregate extends AnalyzerRules.Parameteri
         for (LogicalPlan child : plan.children()) {
             findTimeSeriesSourceTsid(child, tsid);
         }
+    }
+
+    /**
+     * The {@link MetricSamples} on the main input path of this aggregate, if any, mirroring the traversal scope of
+     * {@code findTimeSeriesSourceTsid}.
+     */
+    private static MetricSamples findMetricSamples(LogicalPlan plan) {
+        if (plan instanceof MetricSamples samples) {
+            return samples;
+        }
+        if (plan instanceof BinaryPlan binary) {
+            return findMetricSamples(binary.left());
+        }
+        for (LogicalPlan child : plan.children()) {
+            MetricSamples samples = findMetricSamples(child);
+            if (samples != null) {
+                return samples;
+            }
+        }
+        return null;
     }
 
     /**

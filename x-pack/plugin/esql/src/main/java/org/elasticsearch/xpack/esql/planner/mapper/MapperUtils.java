@@ -24,6 +24,7 @@ import org.elasticsearch.xpack.esql.plan.logical.IpLocation;
 import org.elasticsearch.xpack.esql.plan.logical.LeafPlan;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.MMR;
+import org.elasticsearch.xpack.esql.plan.logical.MetricSamples;
 import org.elasticsearch.xpack.esql.plan.logical.MvExpand;
 import org.elasticsearch.xpack.esql.plan.logical.PackDims;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
@@ -58,6 +59,7 @@ import org.elasticsearch.xpack.esql.plan.physical.InsertEmptyBucketsExec;
 import org.elasticsearch.xpack.esql.plan.physical.IpLocationExec;
 import org.elasticsearch.xpack.esql.plan.physical.LocalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.MMRExec;
+import org.elasticsearch.xpack.esql.plan.physical.MetricSamplesExec;
 import org.elasticsearch.xpack.esql.plan.physical.MvExpandExec;
 import org.elasticsearch.xpack.esql.plan.physical.PackDimsExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
@@ -110,6 +112,18 @@ public class MapperUtils {
 
         if (p instanceof Eval eval) {
             return new EvalExec(eval.source(), child, eval.fields());
+        }
+
+        if (p instanceof MetricSamples samples) {
+            return new MetricSamplesExec(
+                samples.source(),
+                child,
+                samples.metricName(),
+                samples.tsid(),
+                samples.seriesId(),
+                samples.name(),
+                samples.value()
+            );
         }
 
         if (p instanceof PackDims pack) {

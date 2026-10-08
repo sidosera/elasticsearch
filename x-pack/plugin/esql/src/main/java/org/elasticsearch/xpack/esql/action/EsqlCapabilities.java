@@ -4335,6 +4335,13 @@ public class EsqlCapabilities {
          */
         FIX_PROMQL_SELECTOR_NAME_MATCHERS,
 
+        /**
+         * PromQL selectors that name no single metric, such as {@code {__name__=~"http_.*"}} or {@code {job="api"}}, select every
+         * numeric metric whose name matches, each shard among its own mapped metrics; every selected metric is a series of its
+         * own, named by a {@code __name__} column.
+         */
+        PROMQL_METRIC_NAME_SELECTION(PROMQL_COMMAND_V0.isEnabled()),
+
         // Last capability should still have a comma for fewer merge conflicts when adding new ones :)
         // This comment prevents the semicolon from being on the previous capability when Spotless formats the file.
         ;

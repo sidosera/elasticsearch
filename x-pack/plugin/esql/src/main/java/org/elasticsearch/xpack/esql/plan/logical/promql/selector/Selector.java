@@ -14,12 +14,15 @@ import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
+import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
+import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.expression.TimeSeriesMetadataAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.predicate.Predicates;
 import org.elasticsearch.xpack.esql.parser.promql.PromqlLogicalPlanBuilder;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.logical.MetricSamples;
 import org.elasticsearch.xpack.esql.plan.logical.UnaryPlan;
 import org.elasticsearch.xpack.esql.plan.logical.local.EmptyLocalSupplier;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
@@ -34,6 +37,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.UnaryOperator;
 
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.project;
 
@@ -125,10 +129,10 @@ public abstract sealed class Selector extends UnaryPlan implements PromqlPlan pe
     }
 
     /**
-     * The samples a source-backed selector reads: the field of the one metric its name constraints admit, or nothing at all
-     * when they admit none. Selecting metrics by a general name constraint is rejected by the verifier before translation.
+     * The samples a selector reads directly: the field of the one metric its name constraints admit, or nothing at all when
+     * they admit none. A selection by general name constraints reads its samples through {@link MetricSamples} instead.
      */
-    protected final Expression samples() {
+    private Expression samples() {
         return switch (metricName.selection()) {
             case EXACT -> series;
             case EMPTY -> new Literal(source(), null, DataType.DOUBLE);
@@ -152,11 +156,30 @@ public abstract sealed class Selector extends UnaryPlan implements PromqlPlan pe
     }
 
     /**
-     * Translates a source-backed selector (instant or range) reading {@code value} per series; the selector predicate becomes
-     * a pending filter. Shared by the selectors that read the source relation; each still declares its own
-     * {@link #translate} so a new selector cannot inherit this lowering by accident.
+     * The label column naming the metric of each series. Only a selection by general name constraints reads several metrics,
+     * and its series keep their metric apart by this column rather than by a stored {@code __name__} label.
      */
-    protected final IntermediateResult translateSeries(TranslationContext context, Expression value) {
+    public List<Attribute> metricNameOutput() {
+        if (this instanceof LiteralSelector || metricName.selection() != MetricNameMatchers.Selection.GENERAL) {
+            return List.of();
+        }
+        return List.of(new ReferenceAttribute(source(), null, LabelMatcher.NAME, DataType.KEYWORD));
+    }
+
+    /** Whether {@code plan} reads metrics selected by general name constraints, whose series carry their metric's name. */
+    public static boolean selectsMetricsByName(LogicalPlan plan) {
+        return plan.anyMatch(p -> p instanceof Selector selector && selector.metricNameOutput().isEmpty() == false);
+    }
+
+    /**
+     * Translates a source-backed selector (instant or range), {@code perSeries} turning the samples it reads into the value of
+     * each series; the selector predicate becomes a pending filter. Shared by the selectors that read the source relation; each
+     * still declares its own {@link #translate} so a new selector cannot inherit this lowering by accident.
+     * <p>
+     * A selection by general name constraints reads the samples of every metric each shard selects ({@link MetricSamples}),
+     * and carries the metric name as a label so the series of different metrics never merge.
+     */
+    protected final IntermediateResult translateSeries(TranslationContext context, UnaryOperator<Expression> perSeries) {
         LogicalPlan input = context.cmd().child();
         LogicalPlan foldedPlan = PromqlLogicalPlanBuilder.tryFoldRelation(context.cmd(), input);
 
@@ -174,8 +197,34 @@ public abstract sealed class Selector extends UnaryPlan implements PromqlPlan pe
             .filter(attribute -> attribute instanceof FieldAttribute field && field.isDimension())
             .filter(attribute -> attribute instanceof TimeSeriesMetadataAttribute == false)
             .toList();
+        List<String> labels = new ArrayList<>(TranslationContext.mapFinite(dimensions));
+        Expression samples;
+        if (metricName.selection() == MetricNameMatchers.Selection.GENERAL) {
+            MetricSamples metricSamples = MetricSamples.select(source(), input, metricName, sourceTsid(input));
+            input = metricSamples;
+            samples = metricSamples.value();
+            if (labels.contains(LabelMatcher.NAME) == false) {
+                labels.add(LabelMatcher.NAME);
+            }
+        } else {
+            samples = samples();
+        }
         // Expose only required labels that exist on the relation. Consumers null-fill any required label that is absent.
-        TranslationSchema schema = project(context.required(), TranslationContext.mapFinite(dimensions));
-        return new IntermediateResult(input, schema, value, context.stepAttr(), predicate(context.configuration()));
+        TranslationSchema schema = project(context.required(), labels);
+        if (input instanceof MetricSamples && schema.isOpen()) {
+            // the samples of different metrics can share every stored label: their metric name keeps them apart
+            schema = TranslationSchema.union(schema, TranslationSchema.finite(List.of(LabelMatcher.NAME)));
+        }
+        return new IntermediateResult(input, schema, perSeries.apply(samples), context.stepAttr(), predicate(context.configuration()));
+    }
+
+    /** The {@code _tsid} of the source relation, or a new one for the time-series aggregation to add to it. */
+    private static Attribute sourceTsid(LogicalPlan input) {
+        for (Attribute attribute : input.output()) {
+            if (MetadataAttribute.TSID_FIELD.equals(attribute.name())) {
+                return attribute;
+            }
+        }
+        return new MetadataAttribute(Source.EMPTY, MetadataAttribute.TSID_FIELD, DataType.TSID_DATA_TYPE, false);
     }
 }

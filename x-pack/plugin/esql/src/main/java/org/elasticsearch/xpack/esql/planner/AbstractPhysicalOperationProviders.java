@@ -46,6 +46,7 @@ import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.EvalExec;
 import org.elasticsearch.xpack.esql.plan.physical.ExternalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec;
+import org.elasticsearch.xpack.esql.plan.physical.MetricSamplesExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.ProjectExec;
 import org.elasticsearch.xpack.esql.plan.physical.ReadDimsExec;
@@ -85,6 +86,12 @@ public abstract class AbstractPhysicalOperationProviders {
 
     public abstract PhysicalOperation readDimsPhysicalOperation(
         ReadDimsExec readDimsExec,
+        PhysicalOperation source,
+        LocalExecutionPlannerContext context
+    );
+
+    public abstract PhysicalOperation metricSamplesPhysicalOperation(
+        MetricSamplesExec metricSamplesExec,
         PhysicalOperation source,
         LocalExecutionPlannerContext context
     );
