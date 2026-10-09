@@ -12,9 +12,12 @@ import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
 import org.elasticsearch.xpack.esql.expression.promql.function.FunctionType;
 import org.elasticsearch.xpack.esql.expression.promql.function.PromqlFunctionDefinition;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
+import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.Selector;
 
 import java.util.List;
 
@@ -60,7 +63,9 @@ public final class WithinSeriesAggregate extends PromqlFunctionCall {
     public List<Attribute> output() {
         if (output == null) {
             // returns values grouped per time series
-            output = List.of(FieldAttribute.timeSeriesAttribute(source()));
+            // series of different metrics read by one selector stay apart by their metric name
+            List<Attribute> metricName = child() instanceof Selector selector ? selector.metricNameOutput() : List.of();
+            output = CollectionUtils.combine(List.of(FieldAttribute.timeSeriesAttribute(source())), metricName);
         }
         return output;
     }
@@ -74,5 +79,10 @@ public final class WithinSeriesAggregate extends PromqlFunctionCall {
     public boolean isIdentityTransparent() {
         // Per-series aggregation (e.g. rate): series identity passes through unchanged.
         return true;
+    }
+
+    @Override
+    public IntermediateResult translate(TranslationContext context) {
+        return translateValueFunction(context);
     }
 }

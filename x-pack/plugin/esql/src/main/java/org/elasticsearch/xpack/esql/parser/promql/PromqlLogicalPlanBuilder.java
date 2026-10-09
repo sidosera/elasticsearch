@@ -21,7 +21,6 @@ import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
 import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.expression.UnresolvedAttribute;
 import org.elasticsearch.xpack.esql.core.expression.predicate.operator.arithmetic.Arithmetics;
-import org.elasticsearch.xpack.esql.core.tree.Node;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.expression.function.grouping.Bucket;
@@ -54,8 +53,9 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.Evaluation;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.InstantSelector;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
-import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatchers;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelPredicate;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LiteralSelector;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.MetricNameMatchers;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.RangeSelector;
 
 import java.time.Duration;
@@ -65,7 +65,6 @@ import java.util.List;
 import java.util.Locale;
 
 import static java.util.Collections.emptyList;
-import static org.elasticsearch.xpack.esql.parser.ParserUtils.visitList;
 import static org.elasticsearch.xpack.esql.parser.PromqlBaseParser.AND;
 import static org.elasticsearch.xpack.esql.parser.PromqlBaseParser.ASTERISK;
 import static org.elasticsearch.xpack.esql.parser.PromqlBaseParser.CARET;
@@ -205,7 +204,9 @@ public class PromqlLogicalPlanBuilder extends PromqlExpressionBuilder {
         return switch (result) {
             case LogicalPlan plan -> plan;
             case Literal literal -> new LiteralSelector(source, literal);
-            case Duration duration -> new LiteralSelector(source, Literal.timeDuration(source, duration));
+            // Prometheus: a duration in an expression is another spelling of a float literal, its number of seconds
+            // (`2m` is `120`, `1ms` is `0.001`); a range or offset written this way turns it back into a duration.
+            case Duration duration -> new LiteralSelector(source, Literal.fromDouble(source, duration.toNanos() / 1_000_000_000.0));
             case Expression expr -> throw new ParsingException(
                 source,
                 "Expected a plan or literal, got expression [{}]",
@@ -235,16 +236,17 @@ public class PromqlLogicalPlanBuilder extends PromqlExpressionBuilder {
         Source source = source(ctx);
         PromqlBaseParser.SeriesMatcherContext seriesMatcher = ctx.seriesMatcher();
         String id = visitIdentifier(seriesMatcher.identifier());
-        List<LabelMatcher> labels = new ArrayList<>();
-        Expression series = null;
-        List<Expression> labelExpressions = new ArrayList<>();
+        // Every spelling of the metric name adds a __name__ matcher, whatever its operator and position; every other matcher is
+        // bound to the field of its own label.
+        List<LabelMatcher> nameMatchers = new ArrayList<>();
+        List<Source> nameSources = new ArrayList<>();
+        List<LabelPredicate> labelPredicates = new ArrayList<>();
 
         boolean identifierId = (id != null);
 
         if (id != null) {
-            labels.add(new LabelMatcher(NAME, id, LabelMatcher.Matcher.EQ));
-            // TODO: metric/ts name can be missing (e.g. {label=~"value"})
-            series = new UnresolvedAttribute(source(seriesMatcher.identifier()), id);
+            nameMatchers.add(new LabelMatcher(NAME, id, LabelMatcher.Matcher.EQ));
+            nameSources.add(source(seriesMatcher.identifier()));
         }
 
         boolean nonEmptyMatcher = id != null;
@@ -264,14 +266,8 @@ public class PromqlLogicalPlanBuilder extends PromqlExpressionBuilder {
                     if (identifierId) {
                         throw new ParsingException(source(labelCtx), "Metric name must not be defined twice: [{}] or [{}]", id, labelName);
                     }
-                    // set id/series from first label-based name
-                    if (id == null) {
-                        id = labelName;
-                        series = new UnresolvedAttribute(source(labelCtx), id);
-                    }
-                    // always add as label matcher
-                    labels.add(new LabelMatcher(NAME, labelName, LabelMatcher.Matcher.EQ));
-                    labelExpressions.add(new UnresolvedAttribute(source(nameCtx), NAME));
+                    nameMatchers.add(new LabelMatcher(NAME, labelName, LabelMatcher.Matcher.EQ));
+                    nameSources.add(source(labelCtx));
                     nonEmptyMatcher = true;
 
                     continue;
@@ -320,8 +316,9 @@ public class PromqlLogicalPlanBuilder extends PromqlExpressionBuilder {
                     }
                 }
 
-                // __name__ with explicit matcher
+                LabelMatcher label = new LabelMatcher(labelName, matcherValues, matcher);
                 if (NAME.equals(labelName)) {
+                    // __name__ with explicit matcher
                     if (identifierId) {
                         throw new ParsingException(
                             source(nameCtx),
@@ -330,17 +327,11 @@ public class PromqlLogicalPlanBuilder extends PromqlExpressionBuilder {
                             matcherValues.getFirst()
                         );
                     }
-                    // set id/series from the first label-based name
-                    if (id == null) {
-                        id = matcherValues.getFirst();
-                        series = new UnresolvedAttribute(valueSource, id);
-                    }
+                    nameMatchers.add(label);
+                    nameSources.add(valueSource);
+                } else {
+                    labelPredicates.add(new LabelPredicate(source(labelCtx), new UnresolvedAttribute(source(nameCtx), labelName), label));
                 }
-
-                // always add a label matcher
-                LabelMatcher label = new LabelMatcher(labelName, matcherValues, matcher);
-                labels.add(label);
-                labelExpressions.add(new UnresolvedAttribute(source(nameCtx), labelName));
 
                 // require at least one non-empty matcher
                 if (nonEmptyMatcher == false && label.matchesEmpty() == false) {
@@ -355,11 +346,16 @@ public class PromqlLogicalPlanBuilder extends PromqlExpressionBuilder {
         Evaluation evaluation = visitEvaluation(ctx.evaluation());
         Expression range = visitDuration(ctx.duration());
 
-        final LabelMatchers matchers = new LabelMatchers(labels);
+        MetricNameMatchers metricName = nameMatchers.isEmpty() ? MetricNameMatchers.NONE : new MetricNameMatchers(nameMatchers);
+        // Only a name the matchers reduce to is read as a field, sourced from the matcher that supplied it: a negative matcher's
+        // value or a pattern is never a field name.
+        Expression series = metricName.selection() == MetricNameMatchers.Selection.EXACT
+            ? new UnresolvedAttribute(nameSources.get(metricName.namingMatcher()), metricName.exactName())
+            : null;
 
         return range == Literal.NULL
-            ? new InstantSelector(source, series, labelExpressions, matchers, evaluation)
-            : new RangeSelector(source, series, labelExpressions, matchers, range, evaluation);
+            ? new InstantSelector(source, series, metricName, labelPredicates, evaluation)
+            : new RangeSelector(source, series, metricName, labelPredicates, range, evaluation);
     }
 
     private static String toStringValue(Source source, String paramName, Object value) {
@@ -537,16 +533,8 @@ public class PromqlLogicalPlanBuilder extends PromqlExpressionBuilder {
         String name = ctx.IDENTIFIER().getText().toLowerCase(Locale.ROOT);
 
         var paramsCtx = ctx.functionParams();
-        List<Node> params = paramsCtx != null ? visitList(this, paramsCtx.expression(), Node.class) : emptyList();
-
-        List<LogicalPlan> rawParams = new ArrayList<>(params.size());
-        for (Node node : params) {
-            rawParams.add(switch (node) {
-                case LogicalPlan plan -> plan;
-                case Literal literal -> new LiteralSelector(source, literal);
-                default -> throw new IllegalStateException("Unexpected param: " + node);
-            });
-        }
+        // every argument is a plan: a literal (a duration one included) wraps into its selector
+        List<LogicalPlan> rawParams = paramsCtx != null ? paramsCtx.expression().stream().map(this::wrapLiteral).toList() : emptyList();
 
         PromqlBaseParser.GroupingContext groupingContext = ctx.grouping();
         AcrossSeriesAggregate.Grouping grouping = null;

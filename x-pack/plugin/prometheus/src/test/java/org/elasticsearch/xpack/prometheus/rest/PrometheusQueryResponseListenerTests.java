@@ -22,6 +22,7 @@ import org.elasticsearch.xpack.esql.action.ColumnInfoImpl;
 import org.elasticsearch.xpack.prometheus.rest.PrometheusQueryResponseListener.QueryMode;
 
 import java.io.IOException;
+import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.List;
@@ -83,6 +84,35 @@ public class PrometheusQueryResponseListenerTests extends ESTestCase {
         }
     }
 
+    // Metrics selected by a __name__ pattern keep their name in a column next to the packed _timeseries labels: both make up
+    // the series' labels.
+    public void testConvertRangeQueryWithSeriesColumnAndMetricName() throws IOException {
+        List<ColumnInfoImpl> columns = List.of(
+            col("value", "double"),
+            col("_timeseries", "keyword"),
+            col("__name__", "keyword"),
+            col("step", "long")
+        );
+        List<List<Object>> rows = List.of(
+            List.of(List.of(1.0, 2.0), "{\"labels\":{\"host\":\"a\"}}", "rx", List.of(1735689600000L, 1735689660000L)),
+            List.of(List.of(3.0, 4.0), "{\"attributes\":{\"host\":\"a\"}}", "tx", List.of(1735689600000L, 1735689660000L))
+        );
+        try (
+            XContentBuilder builder = PrometheusQueryResponseListener.convertToPrometheusJson(
+                pagesOf(rows),
+                columns,
+                ZoneOffset.UTC,
+                "matrix",
+                QueryMode.RANGE
+            )
+        ) {
+            ObjectPath path = toObjectPath(builder);
+            assertSuccessMatrix(path);
+            assertThat(path.evaluate("data.result.0.metric"), equalTo(Map.of("host", "a", "__name__", "rx")));
+            assertThat(path.evaluate("data.result.1.metric"), equalTo(Map.of("attributes.host", "a", "__name__", "tx")));
+        }
+    }
+
     // A null label value (e.g. a BY label null-filled because it was absent from a series) must be OMITTED from the
     // Prometheus `metric` object, not serialized as an empty string. PromQL distinguishes an absent label from a label
     // whose value is "". This mirrors the `_timeseries` JSON path, which only emits non-null entries.
@@ -121,6 +151,66 @@ public class PrometheusQueryResponseListenerTests extends ESTestCase {
             assertThat(path.evaluate("data.result.1.metric.__name__"), equalTo("http_requests_total"));
             assertThat(path.evaluate("data.result.1.metric.job"), equalTo("prometheus"));
             assertThat(path.evaluate("data.result.1.metric.instance"), nullValue());
+        }
+    }
+
+    /** Prometheus renders a string result as {@code [<unix_time>, "<string>"]}. */
+    public void testBuildStringResult() throws IOException {
+        try (
+            XContentBuilder builder = PrometheusQueryResponseListener.buildStringResult(Instant.parse("2025-01-01T00:00:00Z"), "a string")
+        ) {
+            ObjectPath path = toObjectPath(builder);
+            assertThat(path.evaluate("status"), equalTo("success"));
+            assertThat(path.evaluate("data.resultType"), equalTo("string"));
+            assertThat(path.evaluate("data.result"), equalTo(List.of(1735689600.0, "a string")));
+        }
+    }
+
+    /** Prometheus treats a label with an empty value as absent: the key is omitted, on the label column path. */
+    public void testConvertRangeQueryOmitsEmptyLabelColumnValues() throws IOException {
+        List<ColumnInfoImpl> columns = List.of(
+            col("value", "double"),
+            col("__name__", "keyword"),
+            col("dst", "keyword"),
+            col("job", "keyword"),
+            col("step", "long")
+        );
+        List<List<Object>> rows = List.of(
+            List.of(List.of(1.5, 2.0), "http_requests_total", "", "prometheus", List.of(1735689600000L, 1735689660000L))
+        );
+
+        assertMetric(rows, columns, Map.of("__name__", "http_requests_total", "job", "prometheus"));
+    }
+
+    /** Prometheus treats a label with an empty value as absent: the key is omitted, on the {@code _timeseries} path. */
+    public void testConvertRangeQueryOmitsEmptyTimeseriesLabelValues() throws IOException {
+        List<ColumnInfoImpl> columns = List.of(col("value", "double"), col("_timeseries", "keyword"), col("step", "long"));
+        List<List<Object>> rows = List.of(
+            List.of(
+                List.of(1.5, 2.0),
+                "{\"labels\":{\"__name__\":\"http_requests_total\",\"instance\":\"\",\"job\":\"prometheus\"}}",
+                List.of(1735689600000L, 1735689660000L)
+            )
+        );
+
+        assertMetric(rows, columns, Map.of("__name__", "http_requests_total", "job", "prometheus"));
+    }
+
+    private static void assertMetric(List<List<Object>> rows, List<ColumnInfoImpl> columns, Map<String, String> metric) throws IOException {
+        List<Page> pages = pagesOf(rows);
+        try (
+            XContentBuilder builder = PrometheusQueryResponseListener.convertToPrometheusJson(
+                pages,
+                columns,
+                ZoneOffset.UTC,
+                "matrix",
+                QueryMode.RANGE
+            )
+        ) {
+            ObjectPath path = toObjectPath(builder);
+            assertSuccessMatrix(path);
+            assertThat(path.evaluate("data.result"), hasSize(1));
+            assertThat(path.evaluate("data.result.0.metric"), equalTo(metric));
         }
     }
 

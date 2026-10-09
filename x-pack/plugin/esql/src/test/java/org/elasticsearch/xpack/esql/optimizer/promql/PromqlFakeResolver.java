@@ -122,8 +122,8 @@ public class PromqlFakeResolver extends Rule<LogicalPlan, LogicalPlan> {
         plan.transformDownSkipBranch((lp, skipBranch) -> {
             switch (lp) {
                 case Selector selector -> {
-                    Optional.ofNullable(selector.series()).ifPresent(series -> metrics.add(series.sourceText()));
-                    selector.labels().forEach(label -> labels.add(label.sourceText()));
+                    Optional.ofNullable(selector.metricName().exactName()).ifPresent(metrics::add);
+                    selector.labelPredicates().forEach(predicate -> labels.add(predicate.matcher().name()));
                 }
                 case WithinSeriesAggregate within when COUNTER_FUNCTIONS.contains(within.functionName()) -> {
                     skipBranch.set(Boolean.TRUE);

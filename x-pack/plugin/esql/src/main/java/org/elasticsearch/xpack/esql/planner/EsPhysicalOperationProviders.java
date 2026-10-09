@@ -7,15 +7,12 @@
 
 package org.elasticsearch.xpack.esql.planner;
 
-import org.apache.lucene.document.FieldType;
-import org.apache.lucene.index.DocValuesType;
-import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.logging.HeaderWarning;
-import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
@@ -31,6 +28,7 @@ import org.elasticsearch.compute.lucene.query.LuceneSourceOperator;
 import org.elasticsearch.compute.lucene.query.LuceneTopNSourceOperator;
 import org.elasticsearch.compute.lucene.query.MinCompetitiveQuery;
 import org.elasticsearch.compute.lucene.query.TimeSeriesSourceOperator;
+import org.elasticsearch.compute.lucene.read.MetricSamplesOperator;
 import org.elasticsearch.compute.lucene.read.ReadDimsOperator;
 import org.elasticsearch.compute.lucene.read.ValuesSourceReaderOperator;
 import org.elasticsearch.compute.operator.DriverContext;
@@ -46,15 +44,15 @@ import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.analysis.AnalysisRegistry;
 import org.elasticsearch.index.mapper.BlockLoader;
 import org.elasticsearch.index.mapper.DynamicFieldType;
-import org.elasticsearch.index.mapper.IndexType;
 import org.elasticsearch.index.mapper.KeywordFieldMapper;
 import org.elasticsearch.index.mapper.MappedFieldType;
 import org.elasticsearch.index.mapper.MappingLookup;
 import org.elasticsearch.index.mapper.MetadataFieldMapper;
 import org.elasticsearch.index.mapper.NestedLookup;
+import org.elasticsearch.index.mapper.ObjectMapper;
+import org.elasticsearch.index.mapper.PassThroughObjectMapper;
 import org.elasticsearch.index.mapper.SourceFieldMapper;
 import org.elasticsearch.index.mapper.SourceLoader;
-import org.elasticsearch.index.mapper.TextSearchInfo;
 import org.elasticsearch.index.mapper.blockloader.BlockLoaderFunctionConfig;
 import org.elasticsearch.index.mapper.blockloader.ConstantNull;
 import org.elasticsearch.index.query.BoolQueryBuilder;
@@ -76,13 +74,13 @@ import org.elasticsearch.search.internal.SearchContext;
 import org.elasticsearch.search.lookup.SourceFilter;
 import org.elasticsearch.search.sort.SortAndFormats;
 import org.elasticsearch.search.sort.SortBuilder;
-import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.FoldContext;
 import org.elasticsearch.xpack.esql.core.expression.TemporalityAttribute;
 import org.elasticsearch.xpack.esql.core.expression.TimeSeriesMetadataAttribute;
+import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.core.type.CompactMultiTypeEsField;
 import org.elasticsearch.xpack.esql.core.type.DataType;
 import org.elasticsearch.xpack.esql.core.type.FunctionEsField;
@@ -94,10 +92,12 @@ import org.elasticsearch.xpack.esql.expression.function.blockloader.BlockLoaderE
 import org.elasticsearch.xpack.esql.expression.function.scalar.EsqlScalarFunction;
 import org.elasticsearch.xpack.esql.expression.function.scalar.convert.AbstractConvertFunction;
 import org.elasticsearch.xpack.esql.plan.logical.UnmappedFieldsAttribute;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.MetricNameMatchers;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec;
 import org.elasticsearch.xpack.esql.plan.physical.EsQueryExec.Sort;
 import org.elasticsearch.xpack.esql.plan.physical.EstimatesRowSize;
 import org.elasticsearch.xpack.esql.plan.physical.FieldExtractExec;
+import org.elasticsearch.xpack.esql.plan.physical.MetricSamplesExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.ReadDimsExec;
 import org.elasticsearch.xpack.esql.plan.physical.TimeSeriesAggregateExec;
@@ -110,12 +110,16 @@ import org.elasticsearch.xpack.esql.type.EsqlDataTypeRegistry;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 
 import static org.elasticsearch.common.lucene.search.Queries.newNonNestedFilter;
 import static org.elasticsearch.compute.lucene.query.LuceneSourceOperator.NO_LIMIT;
@@ -198,6 +202,10 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
                     && dft.getChildFieldType(name.substring(dotIndex + 1)) != null;
             }
             return false;
+        }
+
+        public boolean isExtractableMappedField(String name) {
+            return isMappedField(name) && mappingLookup().nestedLookup().hasNestedParent(name) == false;
         }
     }
 
@@ -295,6 +303,135 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
         return source.with(new ReadDimsOperator.Factory(valuesSourceReader, docChannel, tsidChannel), layout.build());
     }
 
+    /**
+     * How many selected metrics a {@link MetricSamplesOperator} loads at once. Each loads one block per metric over the whole
+     * input page, so this bounds the memory of reading many metrics without bounding how many can be selected.
+     */
+    static final int METRIC_SAMPLES_CHUNK_SIZE = 16;
+
+    @Override
+    public PhysicalOperation metricSamplesPhysicalOperation(
+        MetricSamplesExec metricSamplesExec,
+        PhysicalOperation source,
+        LocalExecutionPlannerContext context
+    ) {
+        int docChannel = source.layout.get(metricSamplesExec.docAttribute().id()).channel();
+        int tsidChannel = source.layout.get(metricSamplesExec.tsid().id()).channel();
+        IndexedByShardId<ValuesSourceReaderOperator.ShardContext> readers = shardContexts.map(
+            s -> new ValuesSourceReaderOperator.ShardContext(
+                s.searcher().getIndexReader(),
+                s::newSourceLoader,
+                s.storedFieldsSequentialProportion()
+            )
+        );
+        Layout layout = source.layout.builder()
+            .append(metricSamplesExec.seriesId())
+            .append(metricSamplesExec.name())
+            .append(metricSamplesExec.value())
+            .build();
+        return source.with(
+            new MetricSamplesOperator.Factory(
+                selectMetrics(metricSamplesExec.metricName()),
+                METRIC_SAMPLES_CHUNK_SIZE,
+                plannerSettings.valuesLoadingJumboSize(),
+                readers,
+                docChannel,
+                tsidChannel,
+                plannerSettings.sourceReservationFactor(),
+                directoryBytesRead
+            ),
+            layout
+        );
+    }
+
+    /**
+     * The metric fields any local shard selects. A shard selects a mapped metric when the name it exposes the metric under
+     * satisfies every matcher; fields the shard does not let this request see are never selected. A metric is read with one
+     * loader per element type, and each shard reads it only where it selects it, under its own name for it.
+     */
+    private List<MetricSamplesOperator.Metric> selectMetrics(MetricNameMatchers metricName) {
+        record Slot(String field, DataType type) {}
+        Map<Slot, Map<Integer, BytesRef>> namesByShard = new LinkedHashMap<>();
+        for (ShardContext shard : shardContexts.iterable()) {
+            MappingLookup mappingLookup = shard.mappingLookup();
+            List<PassThroughObjectMapper> passThroughs = new ArrayList<>();
+            for (ObjectMapper objectMapper : mappingLookup.objectMappers().values()) {
+                if (objectMapper instanceof PassThroughObjectMapper passThrough) {
+                    passThroughs.add(passThrough);
+                }
+            }
+            for (String field : mappingLookup.metricFieldMappers().keySet()) {
+                MappedFieldType fieldType = shard.fieldType(field);
+                if (fieldType == null || fieldType.getMetricType() == null || shard.isExtractableMappedField(field) == false) {
+                    continue;
+                }
+                String name = exposedMetricName(shard, passThroughs, field);
+                if (metricName.admits(name) == false) {
+                    continue;
+                }
+                DataType type = EsqlDataTypeRegistry.INSTANCE.fromEs(fieldType.familyTypeName(), fieldType.getMetricType());
+                if (type.noCounter().isNumeric() == false || type.noCounter() == DataType.UNSIGNED_LONG) {
+                    throw new IllegalArgumentException(
+                        "metric ["
+                            + name
+                            + "] of type ["
+                            + fieldType.typeName()
+                            + "] matches the __name__ matchers but only numeric metrics can be selected by name"
+                    );
+                }
+                namesByShard.computeIfAbsent(new Slot(field, type.noCounter()), k -> new HashMap<>())
+                    .put(shard.index(), new BytesRef(name));
+            }
+        }
+        List<MetricSamplesOperator.Metric> metrics = new ArrayList<>(namesByShard.size());
+        for (Map.Entry<Slot, Map<Integer, BytesRef>> e : namesByShard.entrySet()) {
+            String field = e.getKey().field();
+            Map<Integer, BytesRef> names = e.getValue();
+            ValuesSourceReaderOperator.BuildLoader buildLoader = (driverContext, shardId) -> {
+                if (names.containsKey(shardId) == false) {
+                    return ValuesSourceReaderOperator.LOAD_CONSTANT_NULLS;
+                }
+                ShardContext shard = shardContexts.get(shardId);
+                return ValuesSourceReaderOperator.load(
+                    shard.blockLoader(
+                        field,
+                        false,
+                        MappedFieldType.FieldExtractPreference.NONE,
+                        null,
+                        new BlockLoaderWarnings(driverContext, Source.EMPTY),
+                        plannerSettings.blockLoaderSizeOrdinals(),
+                        plannerSettings.blockLoaderSizeScript()
+                    )
+                );
+            };
+            metrics.add(
+                new MetricSamplesOperator.Metric(
+                    new ValuesSourceReaderOperator.FieldInfo(field, PlannerUtils.toElementType(e.getKey().type()), false, buildLoader),
+                    names::get
+                )
+            );
+        }
+        return metrics;
+    }
+
+    /**
+     * The name a shard exposes a metric field under: the name an exact metric name in a query resolves to it. That is the
+     * short name of a field under a passthrough object when the short name resolves to that very field, and its full path
+     * otherwise - for instance when a label of higher passthrough priority takes the short name.
+     */
+    static String exposedMetricName(ShardContext shard, List<PassThroughObjectMapper> passThroughs, String field) {
+        for (PassThroughObjectMapper passThrough : passThroughs) {
+            if (field.startsWith(passThrough.fullPath() + ".")) {
+                String shortName = field.substring(passThrough.fullPath().length() + 1);
+                MappedFieldType resolved = shard.fieldType(shortName);
+                if (resolved != null && resolved.name().equals(field)) {
+                    return shortName;
+                }
+            }
+        }
+        return field;
+    }
+
     private static String getFieldName(Attribute attr) {
         // Do not use the field attribute name, this can deviate from the field name for union types.
         return attr instanceof FieldAttribute fa ? fa.fieldName().string() : attr.name();
@@ -315,7 +452,14 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
             // here but missing there - a dynamic mapping update that landed after resolution - is read out of _source and reported
             // as unmapped. LOAD has the same race, where it instead loads the field with its new type into a column the coordinator
             // already declared keyword, so both modes are consistent in planning against the schema as of resolution time.
-            return ValuesSourceReaderOperator.load(new UnmappedFieldsBlockLoader(ufa.pattern(), plannerSettings.sourceReservationFactor()));
+            // Leaves this shard declares under a nested parent must not ship: mapped nested subfields stay null, and only
+            // this shard knows its mapping - see the loader's javadoc.
+            MappingLookup mappingLookup = shardContext.ctx.getMappingLookup();
+            Predicate<String> mappedNestedSubfield = path -> mappingLookup.getFullNameToFieldType().containsKey(path)
+                && mappingLookup.nestedLookup().hasNestedParent(path);
+            return ValuesSourceReaderOperator.load(
+                new UnmappedFieldsBlockLoader(ufa.pattern(), plannerSettings.sourceReservationFactor(), mappedNestedSubfield)
+            );
         }
 
         // Apply any block loader function if present
@@ -456,13 +600,6 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
 
     /** A hack to pretend an unmapped field still exists. */
     private static class DefaultShardContextForUnmappedField extends DefaultShardContext {
-        private static final FieldType UNMAPPED_FIELD_TYPE = new FieldType(KeywordFieldMapper.Defaults.FIELD_TYPE);
-        static {
-            UNMAPPED_FIELD_TYPE.setDocValuesType(DocValuesType.NONE);
-            UNMAPPED_FIELD_TYPE.setIndexOptions(IndexOptions.NONE);
-            UNMAPPED_FIELD_TYPE.setStored(false);
-            UNMAPPED_FIELD_TYPE.freeze();
-        }
         /** The one field this context pretends is mapped; any other name behaves exactly as on the context it wraps. */
         private final String fullFieldName;
 
@@ -480,25 +617,6 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
             return name.equals(fullFieldName) || super.isMappedField(name);
         }
 
-        /**
-         * Whether this context creates a keyword type for {@code name}: only for {@link #fullFieldName}, and only where
-         * {@code resolvedType} - what the real mapping resolves for it - is null. Callers pass that in so the mapping is walked once;
-         * {@link #fieldType} is unusable here because it returns the fabricated type.
-         */
-        private boolean createsKeywordType(String name, @Nullable MappedFieldType resolvedType) {
-            return resolvedType == null && name.equals(fullFieldName);
-        }
-
-        // TODO: remove this override, createUnmappedFieldType and UNMAPPED_FIELD_TYPE once
-        // OPTIONAL_FIELDS_FIX_UNMAPPED_OBJECT_VALUE is ungated. While that capability is enabled, blockLoader below returns before
-        // super.blockLoader can consult this, so nothing reads the created type; with the capability disabled this is what keeps a
-        // release build dispatching KeywordFieldType's loaders exactly as it did before the fix, so it cannot go until the gate does.
-        @Override
-        public @Nullable MappedFieldType fieldType(String name) {
-            var superResult = super.fieldType(name);
-            return createsKeywordType(name, superResult) ? createUnmappedFieldType(name, this) : superResult;
-        }
-
         @Override
         public BlockLoader blockLoader(
             String name,
@@ -509,13 +627,11 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
             ByteSizeValue blockLoaderSizeOrdinals,
             ByteSizeValue blockLoaderSizeScript
         ) {
-            // The fabricated keyword type cannot load itself: both of KeywordFieldType#blockLoader's paths mangle an object value, so
-            // read _source directly - see UnmappedKeywordBlockLoader for the two broken paths and the issues (#156381, #156433).
+            // Both of KeywordFieldType#blockLoader's paths mangle an object value from _source, so read _source directly via
+            // UnmappedKeywordBlockLoader - see that class for the two broken paths and the issues (#156381, #156433).
             // TODO: consider fixing FallbackSyntheticSourceBlockLoader instead of working around it here. Rejected for now because it
             // only covers the synthetic-source half, and its constructor rejects the NO_IGNORED_SOURCE format stored source reports.
-            if (asUnsupportedSource == false
-                && EsqlCapabilities.Cap.OPTIONAL_FIELDS_FIX_UNMAPPED_OBJECT_VALUE.isEnabled()
-                && createsKeywordType(name, super.fieldType(name))) {
+            if (asUnsupportedSource == false && name.equals(fullFieldName) && super.fieldType(name) == null) {
                 // Neither LOAD nor LOAD_ALL fuses a function into loading an unmapped field, and unmappedKeywordBlockLoader has
                 // nowhere to put one - so catch it here rather than let it be dropped and surface as a wrong value much later.
                 assert blockLoaderFunctionConfig == null
@@ -542,20 +658,6 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
             // _source. It's a contract that FallbackSyntheticSourceBlockLoader has. An empty sourcePaths means
             // StoredFieldsSpec.NEEDS_SOURCE is in effect, which triggers the entire _source loading.
             return new UnmappedKeywordBlockLoader(name, sourcePaths, context.ctx.getIndexSettings().getIgnoredSourceFormat());
-        }
-
-        static MappedFieldType createUnmappedFieldType(String name, DefaultShardContext context) {
-            var builder = new KeywordFieldMapper.Builder(name, context.ctx.getIndexSettings());
-            builder.docValues(false);
-            builder.indexed(false);
-            return new KeywordFieldMapper.KeywordFieldType(
-                name,
-                IndexType.terms(false, false),
-                new TextSearchInfo(UNMAPPED_FIELD_TYPE, builder.similarity(), Lucene.KEYWORD_ANALYZER, Lucene.KEYWORD_ANALYZER),
-                Lucene.KEYWORD_ANALYZER,
-                builder,
-                context.ctx.isSourceSynthetic()
-            );
         }
     }
 
@@ -587,10 +689,13 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
 
     /**
      * Like {@link #querySupplier(QueryBuilder)} but skips shards where {@code fieldName} is not
-     * a concrete mapped field. Flattened fields store terms for their sub-keys in Lucene even though
-     * those sub-keys are absent from the real mapping; a plain EXISTS query would therefore find
-     * documents in flattened shards and inflate field-level COUNT results. Wildcard ({@code "*"})
-     * means COUNT(*) — count every document — so no per-field guard is applied in that case.
+     * extractable. Flattened fields store terms for their sub-keys in Lucene even though those
+     * sub-keys are absent from the real mapping; nested subfields are in the mapping but
+     * {@link org.elasticsearch.xpack.esql.session.IndexResolver} applies {@code -nested} on the
+     * field-caps request, and {@code include_in_root} copies their values onto the parent
+     * document. A plain EXISTS query would therefore inflate field-level COUNT results. Wildcard
+     * ({@code "*"}) means COUNT(*) — count every document — so no per-field guard is applied in
+     * that case.
      */
     public Function<org.elasticsearch.compute.lucene.ShardContext, List<LuceneSliceQueue.QueryAndTags>> querySupplierForField(
         QueryBuilder builder,
@@ -601,7 +706,7 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
             return innerFn;
         }
         return ctx -> {
-            if (shardContexts.get(ctx.index()).isMappedField(fieldName) == false) {
+            if (shardContexts.get(ctx.index()).isExtractableMappedField(fieldName) == false) {
                 return List.of();
             }
             return innerFn.apply(ctx);
@@ -930,12 +1035,12 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
                 // the field does not exist in this context
                 return ConstantNull.INSTANCE;
             }
-            // Exclude dynamically-resolved flattened sub-keys: fieldType() resolves them to a non-null type, but field caps
-            // does not report them and they must not be extracted (see #154508). Only a dotted name can be such a sub-key,
-            // and for a flat name a non-null fieldType already implies isMappedField(name) == true — so gating the (virtual)
-            // mapped-field probe on the dot keeps flat names (the common case) at a single resolution.
-            if (name.indexOf('.') > 0 // only dotted names can be flattened sub-keys; skip the redundant probe for flat names
-                && isMappedField(name) == false) {
+            // Exclude fields that field caps hides from the coordinator so the shard does not load a differently-typed block:
+            // - flattened sub-keys: fieldType() is non-null but the key is not in the mapping (#154508)
+            // - nested subfields: mapped, but IndexResolver applies -nested on the field-caps request (#154011)
+            // Only dotted names can be either, so gating the extra probes on the dot keeps flat names (the common case)
+            // at a single resolution.
+            if (name.indexOf('.') > 0 && isExtractableMappedField(name) == false) {
                 return ConstantNull.INSTANCE;
             }
             BlockLoader loader = fieldType.blockLoader(

@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.esql.parser.promql;
 
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.esql.EsqlTestUtils;
+import org.elasticsearch.xpack.esql.core.expression.UnresolvedAttribute;
 import org.elasticsearch.xpack.esql.parser.ParsingException;
 import org.elasticsearch.xpack.esql.parser.PromqlParser;
 import org.elasticsearch.xpack.esql.parser.QueryParams;
@@ -23,11 +24,15 @@ import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinarySet
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.InstantSelector;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelPredicate;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LiteralSelector;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.MetricNameMatchers;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.RangeSelector;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.Selector;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -426,6 +431,45 @@ public class PromqlParserTests extends ESTestCase {
         });
     }
 
+    /**
+     * Prometheus: a duration in an expression is another spelling of a float literal, its number of seconds; a range or
+     * offset written as a number (or arithmetic over one) is a duration again, truncated to the millisecond.
+     */
+    public void testDurationLiteralIsSeconds() {
+        assertThat(as(parse("PROMQL index=test step=5m 1h30m").promqlPlan(), LiteralSelector.class).literal().value(), equalTo(5400.0));
+        assertThat(as(parse("PROMQL index=test step=5m 1ms").promqlPlan(), LiteralSelector.class).literal().value(), equalTo(0.001));
+        assertThat(as(parse("PROMQL index=test step=5m 2m + 30s").promqlPlan(), LiteralSelector.class).literal().value(), equalTo(150.0));
+        assertThat(
+            as(parse("PROMQL index=test step=5m foo[300]").promqlPlan(), RangeSelector.class).range().fold(null),
+            equalTo(Duration.ofMinutes(5))
+        );
+        assertThat(
+            as(parse("PROMQL index=test step=5m foo[5m * 2]").promqlPlan(), RangeSelector.class).range().fold(null),
+            equalTo(Duration.ofMinutes(10))
+        );
+        assertThat(
+            as(parse("PROMQL index=test step=5m foo[1.5]").promqlPlan(), RangeSelector.class).range().fold(null),
+            equalTo(Duration.ofMillis(1500))
+        );
+        assertThat(
+            as(parse("PROMQL index=test step=5m foo offset 90").promqlPlan(), InstantSelector.class).evaluation().offset().value(),
+            equalTo(Duration.ofSeconds(90))
+        );
+        assertThat(
+            as(parse("PROMQL index=test step=5m foo[1.0007]").promqlPlan(), RangeSelector.class).range().fold(null),
+            equalTo(Duration.ofMillis(1000))
+        );
+        assertThat(
+            as(parse("PROMQL index=test step=5m foo offset -1.0007").promqlPlan(), InstantSelector.class).evaluation().offset().value(),
+            equalTo(Duration.ofMillis(-1000))
+        );
+        assertThat(
+            as(parse("PROMQL index=test step=5m foo[0.0009]").promqlPlan(), RangeSelector.class).range().fold(null),
+            equalTo(Duration.ofMillis(1))
+        );
+        assertWarnings("Line 1:31: duration [0.0009] is shorter than 1ms, using 1ms instead");
+    }
+
     public void testCaseInsensitivityKeywords() {
         var promql = parse("PROMQL index=test step=5m avg(foo) BY (pod)");
         assertThat(as(promql.promqlPlan(), UnresolvedPromqlFunction.class).grouping(), equalTo(AcrossSeriesAggregate.Grouping.BY));
@@ -477,7 +521,7 @@ public class PromqlParserTests extends ESTestCase {
 
     public void testMatchSameLabelMultipleTimesSuccess() {
         var plan = parse("PROMQL index=test step=5m foo{host!=\"host-1\", host!=\"host-2\"}");
-        List<LabelMatcher> matchers = as(plan.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(plan.promqlPlan(), InstantSelector.class));
         assertThat(matchers, hasSize(3));
         assertThat(matchers.get(0).name(), equalTo("__name__"));
         assertThat(matchers.get(0).getFirstValue(), equalTo("foo"));
@@ -495,6 +539,134 @@ public class PromqlParserTests extends ESTestCase {
     public void testMatchMetricNameMultipleTimesError() {
         ParsingException e = assertThrows(ParsingException.class, () -> parse("PROMQL index=test step=5m foo{__name__=\"bar\"}"));
         assertThat(e.getMessage(), containsString("Metric name must not be defined twice: [foo] or [bar]"));
+    }
+
+    /** Every spelling of a metric name, in any position among the label matchers, parses to the same selector. */
+    public void testEquivalentSpellingsNormalizeToOneSelector() {
+        for (String selector : List.of(
+            "tx{host=\"a\"}",
+            "{__name__=\"tx\", host=\"a\"}",
+            "{host=\"a\", __name__=\"tx\"}",
+            "{\"tx\", host=\"a\"}",
+            "{host=\"a\", \"tx\"}"
+        )) {
+            InstantSelector parsed = as(parse("PROMQL index=test step=5m " + selector).promqlPlan(), InstantSelector.class);
+            assertThat(
+                selector,
+                parsed.metricName().matchers(),
+                equalTo(List.of(new LabelMatcher("__name__", "tx", LabelMatcher.Matcher.EQ)))
+            );
+            assertThat(selector, parsed.metricName().selection(), equalTo(MetricNameMatchers.Selection.EXACT));
+            assertThat(selector, as(parsed.series(), UnresolvedAttribute.class).name(), equalTo("tx"));
+            assertThat(selector, parsed.labelPredicates(), hasSize(1));
+            LabelPredicate host = parsed.labelPredicates().getFirst();
+            assertThat(selector, host.matcher(), equalTo(new LabelMatcher("host", "a", LabelMatcher.Matcher.EQ)));
+            assertThat(selector, as(host.field(), UnresolvedAttribute.class).name(), equalTo("host"));
+        }
+    }
+
+    /** Each label matcher is bound to the field of its own label, never to a neighbour's, and there is no field for a name. */
+    public void testLabelPredicatesAreBoundToTheirOwnFields() {
+        InstantSelector parsed = as(
+            parse("PROMQL index=test step=5m {a=\"1\", __name__=\"tx\", b!=\"2\", __name__!=\"rx\", c=~\"3\"}").promqlPlan(),
+            InstantSelector.class
+        );
+        assertThat(parsed.metricName().matchers().stream().map(LabelMatcher::getFirstValue).toList(), equalTo(List.of("tx", "rx")));
+        for (LabelPredicate predicate : parsed.labelPredicates()) {
+            assertThat(as(predicate.field(), UnresolvedAttribute.class).name(), equalTo(predicate.matcher().name()));
+        }
+        assertThat(parsed.labelPredicates().stream().map(p -> p.matcher().name()).toList(), equalTo(List.of("a", "b", "c")));
+    }
+
+    /** Repeated matchers are a conjunction: every one of them is kept, in source order, even when they contradict. */
+    public void testRepeatedMatchersAreKept() {
+        InstantSelector parsed = as(
+            parse("PROMQL index=test step=5m {__name__=\"tx\", __name__=~\"t.*\", host=\"a\", host=\"b\"}").promqlPlan(),
+            InstantSelector.class
+        );
+        assertThat(
+            parsed.metricName().matchers(),
+            equalTo(
+                List.of(
+                    new LabelMatcher("__name__", "tx", LabelMatcher.Matcher.EQ),
+                    new LabelMatcher("__name__", "t.*", LabelMatcher.Matcher.REG)
+                )
+            )
+        );
+        assertThat(
+            parsed.labelPredicates().stream().map(LabelPredicate::matcher).toList(),
+            equalTo(List.of(new LabelMatcher("host", "a", LabelMatcher.Matcher.EQ), new LabelMatcher("host", "b", LabelMatcher.Matcher.EQ)))
+        );
+    }
+
+    /** The metric name matchers resolve together: only an exact name reads a field, and it must satisfy every matcher. */
+    public void testMetricNameMatchersResolveTogether() {
+        assertMetricSelection("{__name__!=\"rx\", __name__=\"tx\"}", MetricNameMatchers.Selection.EXACT, "tx");
+        assertMetricSelection("{__name__=\"tx\", __name__=~\"t.*\"}", MetricNameMatchers.Selection.EXACT, "tx");
+        assertMetricSelection("{__name__=~\"tx\", host=\"a\"}", MetricNameMatchers.Selection.EXACT, "tx");
+        assertMetricSelection("{__name__=\"tx\", __name__!=\"tx\"}", MetricNameMatchers.Selection.EMPTY, null);
+        assertMetricSelection("{__name__=\"tx\", __name__!~\"t.*\"}", MetricNameMatchers.Selection.EMPTY, null);
+        assertMetricSelection("{\"tx\", \"rx\"}", MetricNameMatchers.Selection.EMPTY, null);
+        assertMetricSelection("{__name__=\"tx\", __name__=\"rx\"}", MetricNameMatchers.Selection.EMPTY, null);
+        assertMetricSelection("{__name__=\"\", host=\"a\"}", MetricNameMatchers.Selection.EMPTY, null);
+        // a negative matcher's value or a pattern is never the name of a metric to read
+        assertMetricSelection("{__name__!=\"tx\", host=\"a\"}", MetricNameMatchers.Selection.GENERAL, null);
+        assertMetricSelection("{__name__!~\"tx\", host=\"a\"}", MetricNameMatchers.Selection.GENERAL, null);
+        assertMetricSelection("{__name__=~\"t.*\", host=\"a\"}", MetricNameMatchers.Selection.GENERAL, null);
+        assertMetricSelection("{__name__=~\"tx|rx\"}", MetricNameMatchers.Selection.GENERAL, null);
+        assertMetricSelection("{host=\"a\"}", MetricNameMatchers.Selection.GENERAL, null);
+    }
+
+    /** The field read for an exact name is named after the matcher that supplied the name, not the first name matcher. */
+    public void testSeriesFieldComesFromTheNamingMatcher() {
+        InstantSelector parsed = as(
+            parse("PROMQL index=test step=5m {__name__!=\"rx\", __name__=\"tx\"}").promqlPlan(),
+            InstantSelector.class
+        );
+        assertThat(parsed.metricName().namingMatcher(), equalTo(1));
+        assertThat(parsed.series().sourceText(), equalTo("\"tx\""));
+    }
+
+    /** A list parameter on __name__ names one metric only when it holds a single name. */
+    public void testMetricNameMatcherWithListParam() {
+        for (var entry : List.of(
+            new Object[] { List.of("tx"), MetricNameMatchers.Selection.EXACT },
+            new Object[] { List.of("tx", "rx"), MetricNameMatchers.Selection.GENERAL }
+        )) {
+            PromqlCommand promql = as(
+                TEST_PARSER.parseQuery("PROMQL index=test step=5m {__name__=?_names}", paramsAsConstant("_names", entry[0])),
+                PromqlCommand.class
+            );
+            assertThat(as(promql.promqlPlan(), InstantSelector.class).metricName().selection(), equalTo(entry[1]));
+        }
+    }
+
+    /** Like Prometheus, a selector needs a matcher that rejects the empty string; any label can provide it. */
+    public void testSelectorRequiresNonEmptyMatcher() {
+        for (String selector : List.of("{host=\"a\"}", "{__name__=~\".+\"}", "{__name__!=\"tx\", host=~\".+\"}")) {
+            assertThat(selector, parse("PROMQL index=test step=5m " + selector).promqlPlan(), instanceOf(InstantSelector.class));
+        }
+        for (String selector : List.of(
+            "{host=\"\"}",
+            "{host!=\"a\"}",
+            "{__name__!=\"tx\"}",
+            "{__name__=~\".*\"}",
+            "{__name__!~\"tx\", host=~\".*\"}"
+        )) {
+            ParsingException e = assertThrows(ParsingException.class, () -> parse("PROMQL index=test step=5m " + selector));
+            assertThat(selector, e.getMessage(), containsString("Vector selector must contain at least one non-empty matcher"));
+        }
+    }
+
+    private static void assertMetricSelection(String selector, MetricNameMatchers.Selection selection, String exactName) {
+        InstantSelector parsed = as(parse("PROMQL index=test step=5m " + selector).promqlPlan(), InstantSelector.class);
+        assertThat(selector, parsed.metricName().selection(), equalTo(selection));
+        assertThat(selector, parsed.metricName().exactName(), equalTo(exactName));
+        if (exactName == null) {
+            assertThat(selector, parsed.series(), nullValue());
+        } else {
+            assertThat(selector, as(parsed.series(), UnresolvedAttribute.class).name(), equalTo(exactName));
+        }
     }
 
     // ---- query-as-param tests ----
@@ -774,7 +946,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{host=?_host}", paramsAsConstant("_host", "server-1")),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers, hasSize(2));
         assertThat(matchers.get(0).name(), equalTo("__name__"));
         assertThat(matchers.get(0).getFirstValue(), equalTo("foo"));
@@ -788,7 +960,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{host=?1}", paramsAsConstant(null, "server-1")),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers, hasSize(2));
         assertThat(matchers.get(1).name(), equalTo("host"));
         assertThat(matchers.get(1).getFirstValue(), equalTo("server-1"));
@@ -800,7 +972,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{host=~?_pattern}", paramsAsConstant("_pattern", "server-.*")),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers, hasSize(2));
         assertThat(matchers.get(1).name(), equalTo("host"));
         // Passed through as-is - user controls the regex
@@ -813,7 +985,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{host!=?_host}", paramsAsConstant("_host", "server-1")),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers.get(1).matcher(), equalTo(LabelMatcher.Matcher.NEQ));
     }
 
@@ -822,7 +994,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{host!~?_pattern}", paramsAsConstant("_pattern", "test-.*")),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers.get(1).matcher(), equalTo(LabelMatcher.Matcher.NREG));
     }
 
@@ -835,7 +1007,7 @@ public class PromqlParserTests extends ESTestCase {
             ),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers, hasSize(2));
         assertThat(matchers.get(1).name(), equalTo("service"));
         assertThat(matchers.get(1).isMultiValue(), equalTo(true));
@@ -848,7 +1020,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{env!~?_envs}", paramsAsConstant("_envs", List.of("test", "dev"))),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers.get(1).isMultiValue(), equalTo(true));
         assertThat(matchers.get(1).values(), equalTo(List.of("test", "dev")));
         assertThat(matchers.get(1).matcher(), equalTo(LabelMatcher.Matcher.NREG));
@@ -863,7 +1035,7 @@ public class PromqlParserTests extends ESTestCase {
             ),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers.get(1).isMultiValue(), equalTo(true));
         assertThat(matchers.get(1).values(), equalTo(List.of("server.*", "web-[0-9]+")));
         assertThat(matchers.get(1).matcher(), equalTo(LabelMatcher.Matcher.REG));
@@ -878,7 +1050,7 @@ public class PromqlParserTests extends ESTestCase {
             ),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         // Values preserved as literals without escaping
         assertThat(matchers.get(1).isMultiValue(), equalTo(true));
         assertThat(matchers.get(1).values(), equalTo(List.of("k8s.pod.name", "service.api")));
@@ -891,7 +1063,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{host=~?_host}", paramsAsConstant("_host", "k8s.pod.*")),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers.get(1).getFirstValue(), equalTo("k8s.pod.*"));
         assertThat(matchers.get(1).matcher(), equalTo(LabelMatcher.Matcher.REG));
     }
@@ -902,7 +1074,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{host=?_host}", paramsAsConstant("_host", "k8s.pod.name")),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         // No escaping for exact match - the value is used literally by Automata.makeString
         assertThat(matchers.get(1).getFirstValue(), equalTo("k8s.pod.name"));
         assertThat(matchers.get(1).matcher(), equalTo(LabelMatcher.Matcher.EQ));
@@ -914,7 +1086,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{status_code=?_code}", paramsAsConstant("_code", 200)),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers.get(1).name(), equalTo("status_code"));
         assertThat(matchers.get(1).getFirstValue(), equalTo("200"));
     }
@@ -924,7 +1096,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{enabled=?_flag}", paramsAsConstant("_flag", true)),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers.get(1).getFirstValue(), equalTo("true"));
     }
 
@@ -942,7 +1114,7 @@ public class PromqlParserTests extends ESTestCase {
             ),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers, hasSize(4));
         assertThat(matchers.get(1).name(), equalTo("host"));
         assertThat(matchers.get(1).getFirstValue(), equalTo("server-1"));
@@ -970,7 +1142,7 @@ public class PromqlParserTests extends ESTestCase {
             ),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers, hasSize(2));
         assertThat(matchers.get(1).name(), equalTo("host"));
         // Multi-value preserved as list
@@ -986,7 +1158,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{env!=?_envs}", paramsAsConstant("_envs", List.of("test", "dev"))),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers.get(1).name(), equalTo("env"));
         assertThat(matchers.get(1).isMultiValue(), equalTo(true));
         assertThat(matchers.get(1).values(), equalTo(List.of("test", "dev")));
@@ -1009,7 +1181,7 @@ public class PromqlParserTests extends ESTestCase {
             TEST_PARSER.parseQuery("PROMQL index=test step=5m foo{host=\"server-1\", env=?_env}", paramsAsConstant("_env", "prod")),
             PromqlCommand.class
         );
-        List<LabelMatcher> matchers = as(promql.promqlPlan(), InstantSelector.class).labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(as(promql.promqlPlan(), InstantSelector.class));
         assertThat(matchers, hasSize(3));
         assertThat(matchers.get(1).name(), equalTo("host"));
         assertThat(matchers.get(1).getFirstValue(), equalTo("server-1"));
@@ -1024,7 +1196,7 @@ public class PromqlParserTests extends ESTestCase {
         );
         List<RangeSelector> rangeSelectors = promql.promqlPlan().collect(RangeSelector.class);
         assertThat(rangeSelectors, hasSize(1));
-        List<LabelMatcher> matchers = rangeSelectors.getFirst().labelMatchers().matchers();
+        List<LabelMatcher> matchers = matchers(rangeSelectors.getFirst());
         assertThat(matchers.get(1).name(), equalTo("host"));
         assertThat(matchers.get(1).getFirstValue(), equalTo("server-1"));
     }
@@ -1037,8 +1209,44 @@ public class PromqlParserTests extends ESTestCase {
         List<InstantSelector> selectors = promql.promqlPlan().collect(InstantSelector.class);
         assertThat(selectors, hasSize(2));
         for (InstantSelector selector : selectors) {
-            assertThat(selector.labelMatchers().matchers().get(1).getFirstValue(), equalTo("server-1"));
+            assertThat(matchers(selector).get(1).getFirstValue(), equalTo("server-1"));
         }
+    }
+
+    public void testPromqlExpressionTooLarge() {
+        String query = "m".repeat(PromqlParser.MAX_LENGTH + 1);
+        ParsingException e = assertThrows(ParsingException.class, () -> new PromqlParser().createStatement(query));
+        assertThat(e.getMessage(), containsString("PromQL statement is too large"));
+    }
+
+    public void testPromqlBinaryOperatorChainRejected() {
+        // security#12593: a long chain of binary operators must be rejected before ANTLR builds the parse tree
+        String query = "m" + " + m".repeat(PromqlParser.MAX_BINARY_OPERATORS + 500);
+        ParsingException e = assertThrows(ParsingException.class, () -> new PromqlParser().createStatement(query));
+        assertThat(e.getMessage(), containsString("exceeded the maximum number of binary operators allowed"));
+    }
+
+    public void testPromqlDeepParenthesesRejected() {
+        String query = "(".repeat(PromqlAstBuilder.MAX_EXPRESSION_DEPTH + 10)
+            + "m"
+            + ")".repeat(PromqlAstBuilder.MAX_EXPRESSION_DEPTH + 10);
+        ParsingException e = assertThrows(ParsingException.class, () -> new PromqlParser().createStatement(query));
+        assertThat(e.getMessage(), containsString("exceeded the maximum expression depth allowed"));
+    }
+
+    public void testPromqlCommandBinaryOperatorChainRejectedEndToEnd() {
+        // Same attack shape as security#12593 but through the full PROMQL source command; must fail fast
+        // with a ParsingException (400) rather than exhausting the heap.
+        String inner = "m" + " + m".repeat(PromqlParser.MAX_BINARY_OPERATORS + 500);
+        ParsingException e = assertThrows(ParsingException.class, () -> parse("PROMQL index=test step=5m (" + inner + ")"));
+        assertThat(e.getMessage(), containsString("exceeded the maximum number of binary operators allowed"));
+    }
+
+    /** A selector's matchers in normalized order: the metric name matchers, then the label predicates. */
+    private static List<LabelMatcher> matchers(Selector selector) {
+        List<LabelMatcher> matchers = new ArrayList<>(selector.metricName().matchers());
+        selector.labelPredicates().forEach(predicate -> matchers.add(predicate.matcher()));
+        return matchers;
     }
 
     private static PromqlCommand parse(String query) {

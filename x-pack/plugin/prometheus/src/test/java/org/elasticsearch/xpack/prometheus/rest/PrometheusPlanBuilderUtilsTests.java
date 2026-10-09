@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.prometheus.rest;
 
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
+import org.elasticsearch.xpack.esql.core.expression.Literal;
 import org.elasticsearch.xpack.esql.core.expression.UnresolvedAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.expression.predicate.logical.And;
@@ -20,12 +21,14 @@ import org.elasticsearch.xpack.esql.plan.logical.TsInfo;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.Evaluation;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.InstantSelector;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
-import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatchers;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.MetricNameMatchers;
 
 import java.time.Instant;
+import java.util.Collections;
 import java.util.List;
 
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
@@ -52,6 +55,22 @@ public class PrometheusPlanBuilderUtilsTests extends ESTestCase {
                 "Invalid match[] selector [{not valid!!!}]: line 1:6: mismatched input 'valid' expecting {'!=', '=', '=~', '!~', '}', ','}"
             )
         );
+    }
+
+    public void testParseInstantSelectorsRejectsOversizedBatch() {
+        // Individually valid selectors whose operator count exceeds the limit in total
+        String oneOp = "up == 1";
+        List<String> batch = Collections.nCopies(PromqlParser.MAX_BINARY_OPERATORS + 1, oneOp);
+        IllegalArgumentException ex = expectThrows(
+            IllegalArgumentException.class,
+            () -> PrometheusPlanBuilderUtils.parseInstantSelectors(batch)
+        );
+        assertThat(ex.getMessage(), containsString("maximum number of binary operators allowed in total"));
+    }
+
+    public void testParseInstantSelectorsAcceptsBatchWithinLimits() {
+        List<InstantSelector> selectors = PrometheusPlanBuilderUtils.parseInstantSelectors(List.of("up", "{job=\"api\"}"));
+        assertThat(selectors.size(), is(2));
     }
 
     public void testBuildPreInfoSelectorConditionReturnsIsNotNullForBareMetricName() {
@@ -82,6 +101,37 @@ public class PrometheusPlanBuilderUtilsTests extends ESTestCase {
         assertThat(cond, instanceOf(IsNotNull.class));
     }
 
+    /** Name matchers satisfied by the one metric an equality names reduce to that metric's field. */
+    public void testBuildSelectorConditionsForExactNameAmongNameMatchers() {
+        InstantSelector selector = parseInstantSelector("{__name__!=\"down\",__name__=\"up\",job=\"myjob\"}");
+        Expression cond = PrometheusPlanBuilderUtils.buildPreInfoSelectorCondition(selector);
+        assertThat(containsExpressionOfType(cond, IsNotNull.class), is(true));
+        assertThat(containsAttribute(cond, "up"), is(true));
+        assertThat(containsAttribute(cond, "job"), is(true));
+        assertThat(containsAttribute(cond, "__name__"), is(false));
+        assertThat(PrometheusPlanBuilderUtils.buildPostInfoSelectorCondition(selector), nullValue());
+    }
+
+    /** Name matchers that admit no common metric select nothing, on every endpoint. */
+    public void testBuildSelectorConditionsForContradictoryNameMatchers() {
+        InstantSelector selector = parseInstantSelector("{__name__=\"up\",__name__!=\"up\"}");
+        assertThat(PrometheusPlanBuilderUtils.buildPreInfoSelectorCondition(selector), equalTo(Literal.fromBoolean(Source.EMPTY, false)));
+        assertThat(
+            PrometheusPlanBuilderUtils.buildPreInfoSelectorConditionWithNameFallback(selector),
+            equalTo(Literal.fromBoolean(Source.EMPTY, false))
+        );
+        assertThat(PrometheusPlanBuilderUtils.buildPostInfoSelectorCondition(selector), nullValue());
+    }
+
+    /** A label matcher filters on its own label wherever the metric name matcher sits. */
+    public void testBuildPreInfoSelectorConditionBindsLabelsWhateverTheNamePosition() {
+        for (String selector : List.of("{__name__=\"up\",job=\"myjob\"}", "{job=\"myjob\",__name__=\"up\"}", "up{job=\"myjob\"}")) {
+            Expression cond = PrometheusPlanBuilderUtils.buildPreInfoSelectorCondition(parseInstantSelector(selector));
+            assertThat(selector, containsAttribute(cond, "job"), is(true));
+            assertThat(selector, containsAttribute(cond, "__name__"), is(false));
+        }
+    }
+
     public void testBuildPreInfoSelectorConditionAddsNullableRegexNameHint() {
         InstantSelector selector = parseInstantSelector("{__name__=~\"http.*\"}");
         Expression cond = PrometheusPlanBuilderUtils.buildPreInfoSelectorCondition(selector);
@@ -107,8 +157,8 @@ public class PrometheusPlanBuilderUtilsTests extends ESTestCase {
         InstantSelector selector = new InstantSelector(
             Source.EMPTY,
             null,
+            new MetricNameMatchers(List.of(neqMatcher)),
             List.of(),
-            new LabelMatchers(List.of(neqMatcher)),
             Evaluation.NONE
         );
         Expression cond = PrometheusPlanBuilderUtils.buildPostInfoSelectorCondition(selector);
@@ -117,7 +167,7 @@ public class PrometheusPlanBuilderUtilsTests extends ESTestCase {
     }
 
     public void testBuildPreInfoSelectorConditionEmptyLabelMatchersReturnsNull() {
-        InstantSelector selector = new InstantSelector(Source.EMPTY, null, List.of(), LabelMatchers.EMPTY, Evaluation.NONE);
+        InstantSelector selector = new InstantSelector(Source.EMPTY, null, MetricNameMatchers.NONE, List.of(), Evaluation.NONE);
         assertThat(PrometheusPlanBuilderUtils.buildPreInfoSelectorCondition(selector), nullValue());
         assertThat(PrometheusPlanBuilderUtils.buildPostInfoSelectorCondition(selector), nullValue());
     }

@@ -24,6 +24,7 @@ import org.elasticsearch.xpack.esql.plan.logical.IpLocation;
 import org.elasticsearch.xpack.esql.plan.logical.LeafPlan;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.MMR;
+import org.elasticsearch.xpack.esql.plan.logical.MetricSamples;
 import org.elasticsearch.xpack.esql.plan.logical.MvExpand;
 import org.elasticsearch.xpack.esql.plan.logical.PackDims;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
@@ -34,6 +35,7 @@ import org.elasticsearch.xpack.esql.plan.logical.SparklineGenerateEmptyBuckets;
 import org.elasticsearch.xpack.esql.plan.logical.Subquery;
 import org.elasticsearch.xpack.esql.plan.logical.TimeSeriesAggregate;
 import org.elasticsearch.xpack.esql.plan.logical.TimeSeriesCollapse;
+import org.elasticsearch.xpack.esql.plan.logical.TopNPreFilter;
 import org.elasticsearch.xpack.esql.plan.logical.UnaryPlan;
 import org.elasticsearch.xpack.esql.plan.logical.UnpackDims;
 import org.elasticsearch.xpack.esql.plan.logical.UriParts;
@@ -57,6 +59,7 @@ import org.elasticsearch.xpack.esql.plan.physical.InsertEmptyBucketsExec;
 import org.elasticsearch.xpack.esql.plan.physical.IpLocationExec;
 import org.elasticsearch.xpack.esql.plan.physical.LocalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.MMRExec;
+import org.elasticsearch.xpack.esql.plan.physical.MetricSamplesExec;
 import org.elasticsearch.xpack.esql.plan.physical.MvExpandExec;
 import org.elasticsearch.xpack.esql.plan.physical.PackDimsExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
@@ -68,6 +71,7 @@ import org.elasticsearch.xpack.esql.plan.physical.ShowExec;
 import org.elasticsearch.xpack.esql.plan.physical.SparklineGenerateEmptyBucketsExec;
 import org.elasticsearch.xpack.esql.plan.physical.TimeSeriesAggregateExec;
 import org.elasticsearch.xpack.esql.plan.physical.TimeSeriesCollapseExec;
+import org.elasticsearch.xpack.esql.plan.physical.TopNPreFilterExec;
 import org.elasticsearch.xpack.esql.plan.physical.UnpackDimsExec;
 import org.elasticsearch.xpack.esql.plan.physical.UriPartsExec;
 import org.elasticsearch.xpack.esql.plan.physical.UserAgentExec;
@@ -108,6 +112,18 @@ public class MapperUtils {
 
         if (p instanceof Eval eval) {
             return new EvalExec(eval.source(), child, eval.fields());
+        }
+
+        if (p instanceof MetricSamples samples) {
+            return new MetricSamplesExec(
+                samples.source(),
+                child,
+                samples.metricName(),
+                samples.tsid(),
+                samples.seriesId(),
+                samples.name(),
+                samples.value()
+            );
         }
 
         if (p instanceof PackDims pack) {
@@ -204,7 +220,9 @@ public class MapperUtils {
                 highlight.query(),
                 highlight.fields(),
                 highlight.options(),
-                highlight.generatedAttributes()
+                highlight.generatedAttributes(),
+                highlight.indexKey(),
+                highlight.fieldMappings()
             );
         }
 
@@ -239,6 +257,17 @@ public class MapperUtils {
 
         if (p instanceof Sample sample) {
             return new SampleExec(sample.source(), child, sample.probability());
+        }
+
+        if (p instanceof TopNPreFilter preFilter) {
+            return new TopNPreFilterExec(
+                preFilter.source(),
+                child,
+                preFilter.key(),
+                preFilter.limit(),
+                preFilter.asc(),
+                preFilter.nullsFirst()
+            );
         }
 
         if (p instanceof SparklineGenerateEmptyBuckets sparklineGenerateEmptyBuckets) {

@@ -12,9 +12,14 @@ import org.elasticsearch.xpack.esql.core.expression.Expression;
 import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.tree.NodeInfo;
 import org.elasticsearch.xpack.esql.core.tree.Source;
+import org.elasticsearch.xpack.esql.core.util.CollectionUtils;
+import org.elasticsearch.xpack.esql.expression.function.aggregate.AggregateFunction;
+import org.elasticsearch.xpack.esql.expression.function.aggregate.LastOverTime;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PlaceholderRelation;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlDataType;
+import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext;
+import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
 
 import java.util.List;
 
@@ -42,29 +47,35 @@ import java.util.List;
  */
 public final class InstantSelector extends Selector {
 
-    public InstantSelector(Source source, Expression series, List<Expression> labels, LabelMatchers labelMatchers, Evaluation evaluation) {
-        this(source, PlaceholderRelation.INSTANCE, series, labels, labelMatchers, evaluation);
+    public InstantSelector(
+        Source source,
+        Expression series,
+        MetricNameMatchers metricName,
+        List<LabelPredicate> labelPredicates,
+        Evaluation evaluation
+    ) {
+        this(source, PlaceholderRelation.INSTANCE, series, metricName, labelPredicates, evaluation);
     }
 
     public InstantSelector(
         Source source,
         LogicalPlan child,
         Expression series,
-        List<Expression> labels,
-        LabelMatchers labelMatchers,
+        MetricNameMatchers metricName,
+        List<LabelPredicate> labelPredicates,
         Evaluation evaluation
     ) {
-        super(source, child, series, labels, labelMatchers, evaluation);
+        super(source, child, series, metricName, labelPredicates, evaluation);
     }
 
     @Override
     protected NodeInfo<InstantSelector> info() {
-        return NodeInfo.create(this, InstantSelector::new, child(), series(), labels(), labelMatchers(), evaluation());
+        return NodeInfo.create(this, InstantSelector::new, child(), series(), metricName(), labelPredicates(), evaluation());
     }
 
     @Override
     public InstantSelector replaceChild(LogicalPlan newChild) {
-        return new InstantSelector(source(), newChild, series(), labels(), labelMatchers(), evaluation());
+        return new InstantSelector(source(), newChild, series(), metricName(), labelPredicates(), evaluation());
     }
 
     // @Override
@@ -92,7 +103,7 @@ public final class InstantSelector extends Selector {
     public List<Attribute> output() {
         if (output == null) {
             // returns values grouped per time series
-            output = List.of(FieldAttribute.timeSeriesAttribute(source()));
+            output = CollectionUtils.combine(List.of(FieldAttribute.timeSeriesAttribute(source())), metricNameOutput());
         }
         return output;
     }
@@ -100,5 +111,11 @@ public final class InstantSelector extends Selector {
     @Override
     public PromqlDataType returnType() {
         return PromqlDataType.INSTANT_VECTOR;
+    }
+
+    /** An instant selector maps to LastOverTime to get the latest sample per time series. */
+    @Override
+    public IntermediateResult translate(TranslationContext context) {
+        return translateSeries(context, samples -> new LastOverTime(source(), samples, AggregateFunction.NO_WINDOW, context.time()));
     }
 }
