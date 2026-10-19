@@ -1,6 +1,8 @@
 % Included in both the PromQL limitations page and the ES|QL PROMQL command page. The command page
 % is copied verbatim into the context of agents: Kibana's ES|QL generation docs (esql_docs/esql-promql.txt)
 % and the elasticsearch-esql agent skill (references/promql-command.md).
+% The disabled functional-metadata path is a planning prototype without an execution backend.
+% Keep its experimental label rewrites and matching shapes in this limitations list until they can execute.
 
 The majority of PromQL expressions run unchanged.
 The following constructs are not evaluated yet, so they return a client error (4xx):

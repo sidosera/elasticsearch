@@ -422,6 +422,10 @@ public enum DataType implements Writeable {
             .docValues()
             .supportedSince(DataTypesTransportVersions.INDEX_SOURCE, DataTypesTransportVersions.INDEX_SOURCE)
     ),
+    /** Internal label dictionary manipulated by the time-series scalar functions. Never rendered directly. */
+    TIMESERIES(
+        builder().typeName("TIMESERIES").estimatedSize(1024).underConstruction(TransportVersion.fromName("promql_functional_timeseries"))
+    ),
     PARTIAL_AGG(
         builder().esType("partial_agg")
             .estimatedSize(1024)
@@ -754,7 +758,7 @@ public enum DataType implements Writeable {
     }
 
     public static boolean isPrimitive(DataType t) {
-        return t != OBJECT;
+        return t != OBJECT && t != TIMESERIES;
     }
 
     public static boolean isNull(DataType t) {
@@ -875,7 +879,8 @@ public enum DataType implements Writeable {
     }
 
     public static boolean isSortable(DataType t) {
-        return false == (t == SOURCE
+        return false == (t == TIMESERIES
+            || t == SOURCE
             || isCounter(t)
             || isSpatialOrGrid(t)
             || t == AGGREGATE_METRIC_DOUBLE

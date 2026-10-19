@@ -286,6 +286,7 @@ public class TopNExec extends UnaryExec implements EstimatesRowSize {
                 AGGREGATE_METRIC_DOUBLE, DENSE_VECTOR, GEOHASH, GEOTILE, GEOHEX, EXPONENTIAL_HISTOGRAM, TDIGEST, HISTOGRAM, TSID_DATA_TYPE,
                 DATE_RANGE, DOUBLE_RANGE, PARTIAL_AGG, FLATTENED -> TopNEncoder.DEFAULT_UNSORTABLE;
             case UNSUPPORTED -> TopNEncoder.UNSUPPORTED;
+            case TIMESERIES -> throw new UnsupportedOperationException("time-series metadata execution is not implemented");
         };
         if (Assertions.ENABLED) {
             TopNEncoder keyEncoder = keyEncoder(type);

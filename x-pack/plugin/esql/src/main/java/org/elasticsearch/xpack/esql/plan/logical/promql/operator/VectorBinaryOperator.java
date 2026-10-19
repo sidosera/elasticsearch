@@ -35,11 +35,13 @@ import org.elasticsearch.xpack.esql.plan.logical.join.InnerJoin;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlCommand;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlDataType;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlPlan;
+import org.elasticsearch.xpack.esql.plan.logical.promql.TimeSeriesLabels;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult.Kind;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LabelMatcher;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LiteralSelector;
 import org.elasticsearch.xpack.esql.session.Configuration;
 
 import java.io.IOException;
@@ -47,6 +49,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -74,14 +77,19 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
      * Give the build operand fresh identities for self-joins. Rename its value because {@link InnerJoin#output()}
      * merges columns by name and would otherwise replace the probe value.
      */
-    private record PlanRefresher(String valueName, String refreshedValueName, Map<NameId, NameId> mapper) {
+    private record PlanRefresher(String valueName, String refreshedValueName, Map<NameId, NameId> mapper, Map<NameId, String> columnNames) {
         PlanRefresher(String valueName) {
-            this(valueName, TemporaryNameGenerator.locallyUniqueTemporaryName(valueName), new HashMap<>());
+            this(valueName, TemporaryNameGenerator.locallyUniqueTemporaryName(valueName), new HashMap<>(), new HashMap<>());
+        }
+
+        PlanRefresher(IntermediateResult input) {
+            this(input.valueColumn().name());
+            input.plan().output().forEach(a -> columnNames.put(a.id(), TemporaryNameGenerator.locallyUniqueTemporaryName(a.name())));
         }
 
         private Expression refresh(Expression expression) {
             if (expression instanceof NamedExpression ne) {
-                String name = ne.name().equals(valueName) ? refreshedValueName : ne.name();
+                String name = columnNames.getOrDefault(ne.id(), ne.name().equals(valueName) ? refreshedValueName : ne.name());
                 NameId id = mapper.computeIfAbsent(ne.id(), k -> new NameId());
                 if (ne instanceof Attribute attribute) {
                     return attribute.withName(name).withId(id);
@@ -100,7 +108,8 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
                 refresh(input.valueColumn()),
                 (Attribute) refresh(input.step()),
                 input.pendingFilter(),
-                input.kind()
+                input.kind(),
+                input.labels() == null ? null : input.labels().transform(this::refresh)
             );
         }
     }
@@ -340,10 +349,118 @@ public abstract sealed class VectorBinaryOperator extends BinaryPlan implements 
     /** Translates vector matching as a join; compatible operands compose over a shared aggregate. */
     @Override
     public IntermediateResult translate(TranslationContext context) {
+        if (context.functionalMetadata()) {
+            return translateFunctional(context);
+        }
         if (canTranslateAsAggregate()) {
             return translateAggregate(context);
         }
         return translateJoinOperator(context);
+    }
+
+    private IntermediateResult translateFunctional(TranslationContext context) {
+        if (left() instanceof LiteralSelector literal) {
+            return scalarBinary(context, context.withRequired(open()).translate(right()), literal.literal(), true);
+        }
+        if (right() instanceof LiteralSelector literal) {
+            return scalarBinary(context, context.withRequired(open()).translate(left()), literal.literal(), false);
+        }
+        IntermediateResult left = functionalOperand(context, left());
+        IntermediateResult right = functionalOperand(context, right());
+        boolean probeRight = match().grouping() == VectorMatch.Joining.RIGHT;
+        if (probeRight) {
+            left = new PlanRefresher(left).apply(left);
+        } else {
+            right = new PlanRefresher(right).apply(right);
+        }
+        IntermediateResult probe = probeRight ? right : left;
+        IntermediateResult build = probeRight ? left : right;
+        Alias probeKey = new Alias(
+            source(),
+            TemporaryNameGenerator.locallyUniqueTemporaryName("match_key"),
+            matchLabels(probe.labels(), match()).hash()
+        );
+        Alias buildKey = new Alias(
+            source(),
+            TemporaryNameGenerator.locallyUniqueTemporaryName("match_key"),
+            matchLabels(build.labels(), match()).hash()
+        );
+        LogicalPlan probePlan = new Eval(source(), probe.plan(), List.of(probeKey));
+        var buildAliases = new ArrayList<Alias>(List.of(buildKey));
+        var added = new ArrayList<Attribute>(List.of((Attribute) build.value()));
+        var copied = new LinkedHashMap<String, Expression>();
+        for (String name : new TreeSet<>(match().groupingLabels())) {
+            Alias label = new Alias(source(), TemporaryNameGenerator.locallyUniqueTemporaryName(name), build.labels().get(name));
+            buildAliases.add(label);
+            added.add(label.toAttribute());
+            copied.put(name, label.toAttribute());
+        }
+        var buildOutput = new ArrayList<NamedExpression>(List.of(build.step(), buildKey.toAttribute()));
+        buildOutput.addAll(added);
+        LogicalPlan buildPlan = new Project(source(), new Eval(source(), build.plan(), buildAliases), buildOutput);
+        LogicalPlan join = new InnerJoin(
+            source(),
+            probePlan,
+            buildPlan,
+            List.of(probe.step(), probeKey.toAttribute()),
+            List.of(build.step(), buildKey.toAttribute()),
+            added,
+            match().grouping() == VectorMatch.Joining.NONE
+        );
+        TimeSeriesLabels labels = probe.labels();
+        if (match().grouping() == VectorMatch.Joining.NONE) {
+            labels = switch (match().filter()) {
+                case ON -> labels.by(match().filterLabels());
+                case IGNORING -> labels.without(match().filterLabels());
+                case NONE -> labels;
+            };
+        }
+        for (var label : copied.entrySet()) {
+            labels = labels.set(label.getKey(), label.getValue());
+        }
+        IntermediateResult result = new IntermediateResult(join, labels, probe.value(), probe.step(), Kind.AFTER_INITIAL_AGGREGATE);
+        result = binaryValue(context, result, left.value(), right.value());
+        // Copying labels or discarding the metric name may collapse distinct result identities.
+        return context.checkUnique(context.materialize(result, result.labels()));
+    }
+
+    private IntermediateResult scalarBinary(TranslationContext context, IntermediateResult vector, Expression scalar, boolean scalarLeft) {
+        vector = context.finish(vector);
+        Expression left = scalarLeft ? scalar : vector.value();
+        Expression right = scalarLeft ? vector.value() : scalar;
+        if (this instanceof VectorBinaryComparison comparison && comparison.filterMode()) {
+            Expression condition = binaryOp().asFunction()
+                .create(source(), new ToDouble(source(), left), new ToDouble(source(), right), context.configuration());
+            return vector.with(new Filter(source(), vector.plan(), condition), vector.labels(), vector.value());
+        }
+        IntermediateResult result = binaryValue(context, vector, left, right);
+        return context.checkUnique(context.materialize(result, result.labels()));
+    }
+
+    private IntermediateResult binaryValue(TranslationContext context, IntermediateResult input, Expression left, Expression right) {
+        Expression value = binaryOp().asFunction()
+            .create(source(), new ToDouble(source(), left), new ToDouble(source(), right), context.configuration());
+        TimeSeriesLabels labels = input.labels();
+        if (this instanceof VectorBinaryComparison comparison && comparison.filterMode()) {
+            return input.with(new Filter(source(), input.plan(), value), labels, left);
+        }
+        labels = labels.without(List.of(LabelMatcher.NAME));
+        IntermediateResult result = context.eval(input, this instanceof VectorBinaryComparison ? new ToDouble(source(), value) : value);
+        return result.with(result.plan(), labels, result.value());
+    }
+
+    private IntermediateResult functionalOperand(TranslationContext context, LogicalPlan operand) {
+        TranslationContext branch = context.withRequired(open()).forBranch(operand, new NameId());
+        IntermediateResult result = branch.finish(branch.translate(operand));
+        return result.with(new Filter(source(), result.plan(), new IsNotNull(source(), result.value())), result.labels(), result.value());
+    }
+
+    private static TimeSeriesLabels matchLabels(TimeSeriesLabels labels, VectorMatch match) {
+        return switch (match.filter()) {
+            case ON -> labels.by(match.filterLabels());
+            case IGNORING -> labels.without(match.filterLabels()).without(List.of(LabelMatcher.NAME));
+            case NONE -> labels.without(List.of(LabelMatcher.NAME));
+        };
     }
 
     /** Composes a binary operator as an expression over the operands' shared aggregate. */

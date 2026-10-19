@@ -87,6 +87,18 @@ public abstract sealed class HistogramFunctionCall extends PromqlFunctionCall pe
 
     @Override
     public IntermediateResult translate(TranslationContext context) {
+        if (context.functionalMetadata()) {
+            IntermediateResult child = context.withRequired(open()).translate(child());
+            if (child.value().dataType().isHistogram()) {
+                return new ValueTransformationFunction(source(), child(), definition(), parameters()).translate(context);
+            }
+            child = context.finish(child);
+            return context.aggregate(
+                child,
+                child.labels().without(List.of(LE_LABEL, "__name__")),
+                buildAggregateFunction(new ToDouble(source(), child.value()), child.labels().get(LE_LABEL))
+            );
+        }
         // Classic histogram functions collapse the `le` bucket dimension like a `without (le)` would, and read the
         // bucket bound off the `le` column itself, so the child must also expose it by name.
         List<String> le = List.of(HistogramFunctionCall.LE_LABEL);

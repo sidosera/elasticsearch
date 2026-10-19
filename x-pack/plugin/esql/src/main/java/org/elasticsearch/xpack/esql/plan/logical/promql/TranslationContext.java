@@ -52,9 +52,13 @@ import org.elasticsearch.xpack.esql.plan.logical.UnionAll;
 import org.elasticsearch.xpack.esql.plan.logical.UnpackDims;
 import org.elasticsearch.xpack.esql.plan.logical.join.InnerJoin;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult.Kind;
+import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryArithmetic;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryComparison;
+import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinaryOperator;
 import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorBinarySet;
+import org.elasticsearch.xpack.esql.plan.logical.promql.operator.VectorMatch;
 import org.elasticsearch.xpack.esql.plan.logical.promql.selector.LiteralSelector;
+import org.elasticsearch.xpack.esql.plan.logical.promql.selector.Selector;
 import org.elasticsearch.xpack.esql.session.Configuration;
 
 import java.time.Instant;
@@ -63,9 +67,11 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 
 import static org.elasticsearch.xpack.esql.common.Failure.fail;
 import static org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAndNullable;
@@ -87,12 +93,16 @@ public record TranslationContext(
     /* The current evaluation time (default: @timestamp). */
     Expression time,
     /* Aliases for source metadata projections, shared by every branch of this translation. */
-    Map<Set<String>, Alias> metadataAliases
+    Map<Set<String>, Alias> metadataAliases,
+    boolean functionalMetadata,
+    Set<String> promotedNames
 ) {
     /** PromQL plans with several source identities require independent metadata readers on every participating node. */
     public static final TransportVersion ESQ_ENABLE_TIMESERIES_METADATA_ALIASING = TransportVersion.fromName(
         "esq_enable_timeseries_metadata_aliasing"
     );
+
+    public static final TransportVersion PROMQL_FUNCTIONAL_TIMESERIES = TransportVersion.fromName("promql_functional_timeseries");
 
     // Sentinel bounds for open-ended range queries (PROMQL step=X without explicit start/end): TStep requires explicit bounds,
     // so pass the widest representable range. EPOCH/MAX_MILLIS_BEFORE_9999 avoid time boundary handling in the engine.
@@ -101,12 +111,30 @@ public record TranslationContext(
 
     /** The command exposes every label of the result series: the full open label space. */
     public TranslationContext(PromqlCommand cmd, AnalyzerContext analyzer) {
-        this(cmd, analyzer, null, open(), null, new HashMap<>());
+        this(
+            cmd,
+            analyzer,
+            null,
+            open(),
+            null,
+            new HashMap<>(),
+            cmd != null && functionalMetadataEnabled(cmd, analyzer),
+            cmd != null && analyzer.flags().promqlFunctionalTimeSeries() ? promotions(cmd.promqlPlan()) : Set.of()
+        );
     }
 
     /** Translate an independent child without changing the enclosing branch's timing or aggregation state. */
     public TranslationContext withRequired(TranslationSchema childRequired) {
-        return new TranslationContext(cmd, analyzer, stepBucketAlias, childRequired, time, metadataAliases);
+        return new TranslationContext(
+            cmd,
+            analyzer,
+            stepBucketAlias,
+            childRequired,
+            time,
+            metadataAliases,
+            functionalMetadata,
+            promotedNames
+        );
     }
 
     /**
@@ -120,6 +148,48 @@ public record TranslationContext(
         throw new QlIllegalArgumentException("Unsupported PromQL plan node: {}", node);
     }
 
+    /**
+     * Choose once, before lowering: never combine functional and legacy metadata representations in one query.
+     * @param command command whose operator families determine eligibility
+     * @param analyzer feature flag and participating-node versions
+     * @return whether the entire command can use this prototype
+     */
+    public static boolean functionalMetadataEnabled(PromqlCommand command, AnalyzerContext analyzer) {
+        return analyzer.flags().promqlFunctionalTimeSeries()
+            && analyzer.minimumVersion().supports(PROMQL_FUNCTIONAL_TIMESERIES)
+            && supported(command.promqlPlan())
+            && command.promqlPlan().anyMatch(p -> p instanceof Selector && p instanceof LiteralSelector == false)
+            && command.child().anyMatch(p -> p instanceof EsRelation);
+    }
+
+    private static boolean supported(LogicalPlan plan) {
+        // Keep unrelated families on their existing path while this prototype answers the label-representation question.
+        if (plan instanceof Selector) {
+            return true;
+        }
+        boolean implemented = plan instanceof AcrossSeriesAggregate
+            || plan instanceof WithinSeriesAggregate
+            || plan instanceof ValueTransformationFunction
+            || plan instanceof MetadataManipulationFunction
+            || plan instanceof HistogramFunctionCall
+            || plan instanceof VectorBinaryArithmetic
+            || plan instanceof VectorBinaryComparison;
+        return implemented && plan.children().stream().allMatch(TranslationContext::supported);
+    }
+
+    private static Set<String> promotions(LogicalPlan plan) {
+        var names = new TreeSet<String>();
+        plan.forEachUp(node -> {
+            if (node instanceof AcrossSeriesAggregate aggregate && aggregate.grouping() == AcrossSeriesAggregate.Grouping.BY) {
+                names.addAll(mapFinite(aggregate.groupings()));
+            }
+            if (node instanceof VectorBinaryOperator binary && binary.match().filter() == VectorMatch.Filter.ON) {
+                names.addAll(binary.match().filterLabels());
+            }
+        });
+        return names;
+    }
+
     public Configuration configuration() {
         return analyzer.configuration();
     }
@@ -130,14 +200,21 @@ public record TranslationContext(
 
     /** Translates one merge branch with its own step bucket and evaluation time. */
     public IntermediateResult translateIntermediate(LogicalPlan branch, NameId stepId, NameId valueId) {
+        return forBranch(branch, stepId).translateIntermediate(branch, valueId);
+    }
+
+    /** Each independent input gets its own evaluation time and step identity. */
+    public TranslationContext forBranch(LogicalPlan branch, NameId stepId) {
         Expression branchTime = cmd.collectEvaluationTimestampForBranch(branch);
         Alias step = canCreateStepBucket() ? emitStepBucketExpression(stepId, branchTime) : null;
-        var run = new TranslationContext(cmd, analyzer, step, required, branchTime, metadataAliases);
-        return run.translateIntermediate(branch, valueId);
+        return new TranslationContext(cmd, analyzer, step, required, branchTime, metadataAliases, functionalMetadata, promotedNames);
     }
 
     /** Finishes the command, including independently translated union branches and the declared output projection. */
     public LogicalPlan translateFinal() {
+        if (functionalMetadata) {
+            return forBranch(cmd.promqlPlan(), cmd.stepId()).translateFunctionalResult();
+        }
         // `or` is the only set operator that adds rows (more series), requiring a top-level multi-branch `UnionAll` that
         // cannot compose as a single-value sub-expression.
         // PromQL `or` is left-associative, so flatten the top-level chain into independent branches.
@@ -155,6 +232,24 @@ public record TranslationContext(
             branches.stream().map(b -> translateIntermediate(b, new NameId(), new NameId())).toList()
         );
         return doTranslateFinal(intermediateResultPlan, false);
+    }
+
+    private LogicalPlan translateFunctionalResult() {
+        IntermediateResult result = finish(translate(cmd().promqlPlan()));
+        List<Alias> aliases = new ArrayList<>();
+        aliases.add(emitValueDoubleCastExpression(result.value(), cmd().valueId()));
+        aliases.add(new Alias(cmd.source(), cmd().stepColumnName(), result.step(), cmd().stepId()));
+        if (find(cmd().output(), MetadataAttribute.TIMESERIES) != null) {
+            aliases.add(new Alias(cmd.source(), MetadataAttribute.TIMESERIES, result.labels().render()));
+        }
+        for (Attribute output : cmd().output()) {
+            if (output.id().equals(cmd().valueId()) == false
+                && output.id().equals(cmd().stepId()) == false
+                && output.name().equals(MetadataAttribute.TIMESERIES) == false) {
+                aliases.add(new Alias(cmd.source(), output.name(), result.labels().get(mapFinite(output)), output.id()));
+            }
+        }
+        return doTranslateFinal(new Eval(cmd.source(), result.plan(), aliases), false);
     }
 
     /* Shared by every `final` translation root */
@@ -298,6 +393,77 @@ public record TranslationContext(
         }
         Alias alias = new Alias(value.source(), cmd.valueColumnName(), value);
         return t.with(new Eval(cmd.source(), t.plan(), List.of(alias)), t.schema(), alias.toAttribute());
+    }
+
+    /** Finish a raw functional input at its current label grain. */
+    public IntermediateResult finish(IntermediateResult input) {
+        return input.kind().afterInitialAggregation ? input : aggregate(input, input.labels(), input.value());
+    }
+
+    /** Aggregate the current label state; no future metadata projections need to be carried. */
+    public IntermediateResult aggregate(IntermediateResult input, TimeSeriesLabels labels, Expression function) {
+        if (function instanceof AggregateFunction == false || function instanceof TimeSeriesAggregateFunction) {
+            function = new Values(cmd.source(), function);
+        }
+        Alias value = new Alias(cmd.source(), cmd().valueColumnName(), function);
+        var groups = new ArrayList<Expression>();
+        groups.add(input.kind().afterInitialAggregation == false ? stepBucketAlias() : input.step());
+        var outputs = new ArrayList<NamedExpression>(List.of(value, input.step()));
+        var columns = new LinkedHashMap<String, Expression>();
+        labels.promoted().forEach((name, expression) -> {
+            var column = new Alias(cmd.source(), name, expression);
+            groups.add(column);
+            outputs.add(column.toAttribute());
+            columns.put(name, column.toAttribute());
+        });
+        Expression metadata = null;
+        if (labels.metadata() != null) {
+            // HASH retains an equality witness. A bare fingerprint is insufficient to group or join correctly.
+            groups.add(new Alias(cmd.source(), TemporaryNameGenerator.locallyUniqueTemporaryName("series_key"), labels.hash()));
+            // Carry the current dictionary through both aggregation phases, alongside its canonical key.
+            Alias identity = new Alias(cmd.source(), MetadataAttribute.TIMESERIES, labels.metadata());
+            groups.add(identity);
+            outputs.add(identity.toAttribute());
+            metadata = identity.toAttribute();
+        }
+        LogicalPlan plan = input.kind().afterInitialAggregation == false
+            ? new TimeSeriesAggregate(cmd.source(), input.plan(), groups, outputs, null, time(), TimeSeriesAggregate.Origin.PROMQL_COMMAND)
+            : new Aggregate(cmd.source(), input.plan(), groups, outputs);
+        return new IntermediateResult(
+            plan,
+            new TimeSeriesLabels(columns, metadata),
+            value.toAttribute(),
+            input.step(),
+            Kind.AFTER_INITIAL_AGGREGATE
+        );
+    }
+
+    public IntermediateResult materialize(IntermediateResult input, TimeSeriesLabels labels) {
+        var aliases = new ArrayList<Alias>();
+        var columns = new LinkedHashMap<String, Expression>();
+        labels.promoted().forEach((name, expression) -> {
+            var alias = new Alias(cmd.source(), name, expression);
+            aliases.add(alias);
+            columns.put(name, alias.toAttribute());
+        });
+        Expression metadata = null;
+        if (labels.metadata() != null) {
+            var alias = new Alias(cmd.source(), MetadataAttribute.TIMESERIES, labels.metadata());
+            aliases.add(alias);
+            metadata = alias.toAttribute();
+        }
+        var output = new ArrayList<NamedExpression>(List.of((Attribute) input.value(), input.step()));
+        aliases.forEach(a -> output.add(a.toAttribute()));
+        LogicalPlan plan = new Project(cmd.source(), new Eval(cmd.source(), input.plan(), aliases), output);
+        return input.with(plan, new TimeSeriesLabels(columns, metadata), input.value());
+    }
+
+    public IntermediateResult checkUnique(IntermediateResult result) {
+        return result.with(
+            new CheckSeriesUniqueness(cmd.source(), result.plan(), result.step(), result.labels().hash()),
+            result.labels(),
+            result.value()
+        );
     }
 
     /**
@@ -510,7 +676,7 @@ public record TranslationContext(
      * evaluation timestamp) so it can push down to the index; the branch offset is instead folded into the bounds.
      * Expressing it over the shifted timestamp while also adjusting the bounds would apply the offset twice.
      */
-    private Expression emitBySrcTimeFilter(LogicalPlan branch) {
+    public Expression emitBySrcTimeFilter(LogicalPlan branch) {
         if (cmd.start().value() == null || cmd.end().value() == null) {
             return null;
         }
@@ -524,7 +690,7 @@ public record TranslationContext(
     }
 
     /** Adds an Eval on top of the source relation materializing the evaluation timestamp (@timestamp + offset). */
-    private LogicalPlan pushDownEvaluationTimestampFilter(LogicalPlan plan, LogicalPlan branch) {
+    public LogicalPlan pushDownEvaluationTimestampFilter(LogicalPlan plan, LogicalPlan branch) {
         if (time instanceof ReferenceAttribute ref && cmd.timestampColumnName().equals(ref.name())) {
             Expression base = cmd.timestamp();
             if (base.dataType() == DataType.DATE_NANOS) {
@@ -551,7 +717,7 @@ public record TranslationContext(
     }
 
     /** The value column definition: the translateIntermediate's value expression, cast to double unless it provably is one. */
-    private Alias emitValueDoubleCastExpression(Expression valueExpr, NameId valueId) {
+    Alias emitValueDoubleCastExpression(Expression valueExpr, NameId valueId) {
         if ((valueExpr instanceof Attribute == false && valueExpr.resolved() && valueExpr.dataType() == DataType.DOUBLE) == false) {
             valueExpr = new ToDouble(cmd.source(), valueExpr);
         }
@@ -639,7 +805,9 @@ public record TranslationContext(
         /* Label matcher predicate; flows up until pushed to the relation or folded into an aggregate filter. */
         Expression pendingFilter,
         /* The translator tracks what it built instead of inspecting the plan. */
-        Kind kind
+        Kind kind,
+        /* Current label state on the functional path; null on the compatibility path. */
+        TimeSeriesLabels labels
     ) {
         /** The lifecycle of an intermediate result. A constant is always a finished (aggregation-free) local relation. */
         public enum Kind {
@@ -658,6 +826,28 @@ public record TranslationContext(
             }
         }
 
+        /** Compatibility result: label projections are described by its schema. */
+        public IntermediateResult(
+            LogicalPlan plan,
+            TranslationSchema schema,
+            Expression value,
+            Attribute step,
+            Expression pendingFilter,
+            Kind kind
+        ) {
+            this(plan, schema, value, step, pendingFilter, kind, null);
+        }
+
+        /** Functional result: the labels are current values, without source-projection requirements. */
+        public IntermediateResult(LogicalPlan plan, TimeSeriesLabels labels, Expression value, Attribute step, Kind kind) {
+            this(plan, null, value, step, null, kind, labels);
+        }
+
+        /** Rebuild the functional label state while preserving the aggregation boundary. */
+        public IntermediateResult with(LogicalPlan plan, TimeSeriesLabels labels, Expression value) {
+            return new IntermediateResult(plan, labels, value, step, kind);
+        }
+
         /** A raw input whose value may still contain per-series aggregate expressions. */
         public IntermediateResult(LogicalPlan plan, TranslationSchema schema, Expression value, Attribute step) {
             this(plan, schema, value, step, null, Kind.BEFORE_INITIAL_AGGREGATE);
@@ -670,7 +860,7 @@ public record TranslationContext(
 
         /** This table rebuilt around a new plan, schema and value, keeping its other properties. */
         public IntermediateResult with(LogicalPlan plan, TranslationSchema schema, Expression value) {
-            return new IntermediateResult(plan, schema, value, step, pendingFilter, kind);
+            return new IntermediateResult(plan, schema, value, step, pendingFilter, kind, labels);
         }
 
         /** The value as a defined column; only valid on a finished table. */

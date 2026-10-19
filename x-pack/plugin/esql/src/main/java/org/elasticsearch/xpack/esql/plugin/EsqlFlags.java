@@ -104,6 +104,14 @@ public class EsqlFlags {
         Setting.Property.OperatorDynamic
     );
 
+    /** Disabled on every build: the functional metadata API currently has no execution implementation. */
+    public static final Setting<Boolean> ESQL_PROMQL_FUNCTIONAL_TIMESERIES = Setting.boolSetting(
+        "esql.query.promql.functional_timeseries",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     // this is only used for testing purposes right now
     public static List<Setting<?>> ALL_ESQL_FLAGS_SETTINGS = List.of(
         ESQL_STRING_LIKE_ON_INDEX,
@@ -111,7 +119,8 @@ public class EsqlFlags {
         ESQL_MAX_BRANCH_COUNT,
         ESQL_MAX_BRANCH_LEVEL,
         ESQL_MAX_BRANCH_COUNT_PER_MERGE,
-        ESQL_MAX_FILLNULL_FIELDS
+        ESQL_MAX_FILLNULL_FIELDS,
+        ESQL_PROMQL_FUNCTIONAL_TIMESERIES
     );
 
     /**
@@ -138,6 +147,8 @@ public class EsqlFlags {
     private final int maxBranchCountPerMerge;
 
     private final int maxFillNullFields;
+
+    private final boolean promqlFunctionalTimeSeries;
 
     /**
      * Constructor for tests.
@@ -235,12 +246,25 @@ public class EsqlFlags {
         int maxBranchCountPerMerge,
         int maxFillNullFields
     ) {
+        this(stringLikeOnIndex, roundToPushdownThreshold, maxBranchCount, maxBranchLevel, maxBranchCountPerMerge, maxFillNullFields, false);
+    }
+
+    private EsqlFlags(
+        boolean stringLikeOnIndex,
+        int roundToPushdownThreshold,
+        int maxBranchCount,
+        int maxBranchLevel,
+        int maxBranchCountPerMerge,
+        int maxFillNullFields,
+        boolean promqlFunctionalTimeSeries
+    ) {
         this.stringLikeOnIndex = stringLikeOnIndex;
         this.roundToPushdownThreshold = roundToPushdownThreshold;
         this.maxBranchCount = maxBranchCount;
         this.maxBranchLevel = maxBranchLevel;
         this.maxBranchCountPerMerge = maxBranchCountPerMerge;
         this.maxFillNullFields = maxFillNullFields;
+        this.promqlFunctionalTimeSeries = promqlFunctionalTimeSeries;
     }
 
     public EsqlFlags(ClusterSettings settings) {
@@ -250,7 +274,8 @@ public class EsqlFlags {
             settings.get(ESQL_MAX_BRANCH_COUNT),
             settings.get(ESQL_MAX_BRANCH_LEVEL),
             settings.get(ESQL_MAX_BRANCH_COUNT_PER_MERGE),
-            settings.get(ESQL_MAX_FILLNULL_FIELDS)
+            settings.get(ESQL_MAX_FILLNULL_FIELDS),
+            settings.get(ESQL_PROMQL_FUNCTIONAL_TIMESERIES)
         );
     }
 
@@ -283,6 +308,23 @@ public class EsqlFlags {
         return maxFillNullFields;
     }
 
+    public boolean promqlFunctionalTimeSeries() {
+        return promqlFunctionalTimeSeries;
+    }
+
+    /** Select the experimental translator in planning tests without changing other flags. */
+    public EsqlFlags withPromqlFunctionalTimeSeries(boolean enabled) {
+        return new EsqlFlags(
+            stringLikeOnIndex,
+            roundToPushdownThreshold,
+            maxBranchCount,
+            maxBranchLevel,
+            maxBranchCountPerMerge,
+            maxFillNullFields,
+            enabled
+        );
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
@@ -293,7 +335,8 @@ public class EsqlFlags {
             && maxBranchCount == that.maxBranchCount
             && maxBranchLevel == that.maxBranchLevel
             && maxBranchCountPerMerge == that.maxBranchCountPerMerge
-            && maxFillNullFields == that.maxFillNullFields;
+            && maxFillNullFields == that.maxFillNullFields
+            && promqlFunctionalTimeSeries == that.promqlFunctionalTimeSeries;
     }
 
     @Override
@@ -304,7 +347,8 @@ public class EsqlFlags {
             maxBranchCount,
             maxBranchLevel,
             maxBranchCountPerMerge,
-            maxFillNullFields
+            maxFillNullFields,
+            promqlFunctionalTimeSeries
         );
     }
 
@@ -322,6 +366,8 @@ public class EsqlFlags {
             + maxBranchCountPerMerge
             + ", maxFillNullFields="
             + maxFillNullFields
+            + ", promqlFunctionalTimeSeries="
+            + promqlFunctionalTimeSeries
             + ']';
     }
 }

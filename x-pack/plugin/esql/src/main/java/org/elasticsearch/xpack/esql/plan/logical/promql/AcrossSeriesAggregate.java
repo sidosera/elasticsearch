@@ -180,6 +180,19 @@ public final class AcrossSeriesAggregate extends PromqlFunctionCall {
     @Override
     public IntermediateResult translate(TranslationContext context) {
         List<String> keys = TranslationContext.mapFinite(groupings());
+        if (context.functionalMetadata()) {
+            IntermediateResult child = context.withRequired(grouping() == WITHOUT ? open() : finite(keys)).translate(child());
+            if (child.kind().constant) {
+                return child;
+            }
+            TimeSeriesLabels labels = switch (grouping()) {
+                case BY -> child.labels().by(keys);
+                case WITHOUT -> child.labels().without(keys).without(List.of("__name__"));
+                case NONE -> TimeSeriesLabels.EMPTY;
+            };
+            var promqlCtx = new PromqlContext(context.time(), AggregateFunction.NO_WINDOW, child.step(), context.configuration());
+            return context.aggregate(child, labels, buildEsqlFunction(child.value(), promqlCtx));
+        }
         TranslationSchema childRequired = switch (grouping()) {
             case BY -> finite(keys);
             // without () keeps the child's label set; without (K) declares its own and widens every pending one by K

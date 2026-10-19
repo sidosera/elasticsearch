@@ -400,6 +400,11 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
     }
 
     public void verify(Failures failures, int maxBranches, String limitSource) {
+        verify(failures, maxBranches, limitSource, false);
+    }
+
+    /** Keep legacy representation restrictions until the whole command selects functional metadata. */
+    public void verify(Failures failures, int maxBranches, String limitSource, boolean functionalMetadata) {
         LogicalPlan p = promqlPlan();
         boolean hasStep = step.value() != null;
         boolean hasRangeAndBuckets = start.value() != null && end.value() != null && buckets.value() != null;
@@ -469,7 +474,9 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
                     }
                 }
                 case AcrossSeriesAggregate agg -> {
-                    if (agg.grouping() == AcrossSeriesAggregate.Grouping.WITHOUT && usesWithoutGrouping(agg.child())) {
+                    if (functionalMetadata == false
+                        && agg.grouping() == AcrossSeriesAggregate.Grouping.WITHOUT
+                        && usesWithoutGrouping(agg.child())) {
                         failures.add(fail(agg, "nested WITHOUT over WITHOUT is not supported at this time [{}]", agg.sourceText()));
                     }
                     // Reject labels whose name collides with the built-in step column.
@@ -507,7 +514,9 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
                     LogicalPlan buckets = histogram.child();
                     // Regrouping by every label but `le` needs the labels as named columns. A reduction or a WITHOUT over
                     // raw series keeps them in one `_timeseries` column instead.
-                    if (PromqlLabels.hasTsMetadata(buckets.output()) && (usesReduction(buckets) || usesWithoutGrouping(buckets))) {
+                    if (functionalMetadata == false
+                        && PromqlLabels.hasTsMetadata(buckets.output())
+                        && (usesReduction(buckets) || usesWithoutGrouping(buckets))) {
                         failures.add(
                             fail(
                                 histogram,
@@ -550,7 +559,7 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
                     if (binaryOperator instanceof VectorBinaryArithmetic || binaryOperator instanceof VectorBinaryComparison) {
                         if (match != VectorMatch.NONE && (returnsScalar(left) || returnsScalar(right))) {
                             failures.add(fail(lp, "vector matching only allowed between instant vectors [{}]", lp.sourceText()));
-                        } else if (binaryOperator.canTranslateAsAggregate() == false) {
+                        } else if (functionalMetadata == false && binaryOperator.canTranslateAsAggregate() == false) {
                             boolean leftConcrete = PromqlLabels.hasTsMetadata(left.output()) == false;
                             boolean rightConcrete = PromqlLabels.hasTsMetadata(right.output()) == false;
                             boolean manySideConcrete = match.grouping() == VectorMatch.Joining.RIGHT ? rightConcrete : leftConcrete;
@@ -565,7 +574,8 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
                             if (supported == false) {
                                 failures.add(fail(lp, "vector matching requires operands with concrete label sets [{}]", lp.sourceText()));
                             }
-                        } else if (returnsScalar(left) == false
+                        } else if (functionalMetadata == false
+                            && returnsScalar(left) == false
                             && returnsScalar(right) == false
                             && pairsMetricsInSeparateSeries(binaryOperator)) {
                                 // Implicit ignoring(__name__) over opaque operands needs runtime-defined match keys.
@@ -582,7 +592,7 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
                     }
 
                     if (binaryOperator instanceof VectorBinaryComparison comp) {
-                        if (match == VectorMatch.NONE) {
+                        if (functionalMetadata == false && match == VectorMatch.NONE) {
                             if (root.get() == false) {
                                 failures.add(
                                     fail(lp, "comparison operators are only supported at the top-level at this time [{}]", lp.sourceText())
@@ -608,14 +618,18 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
                         verifySetOperator(failures, setOp, topLevelUnions.contains(setOp));
                     }
 
-                    if (match.filter() == VectorMatch.Filter.NONE && (usesWithoutGrouping(left) || usesWithoutGrouping(right))) {
+                    if (functionalMetadata == false
+                        && match.filter() == VectorMatch.Filter.NONE
+                        && (usesWithoutGrouping(left) || usesWithoutGrouping(right))) {
                         // TODO(sidosera): https://github.com/elastic/elasticsearch/issues/145308
                         failures.add(fail(lp, "binary expressions with WITHOUT are not supported at this time [{}]", lp.sourceText()));
                     }
 
                     boolean bothSourceBacked = hasSourceBackedExpression(left) && hasSourceBackedExpression(right);
                     if (bothSourceBacked) {
-                        verifySourceBackedOperands(failures, binaryOperator);
+                        if (functionalMetadata == false) {
+                            verifySourceBackedOperands(failures, binaryOperator);
+                        }
 
                         // Set operators have independent branches, so different offsets are allowed.
                         if (binaryOperator instanceof VectorBinarySet == false && collectAllOffsetsForBranch(binaryOperator).size() > 1) {
@@ -636,7 +650,9 @@ public class PromqlCommand extends UnaryPlan implements TelemetryAware, Timestam
             root.set(false);
         });
 
-        verifyMetadataManipulationPlacement(p, null, failures);
+        if (functionalMetadata == false) {
+            verifyMetadataManipulationPlacement(p, null, failures);
+        }
     }
 
     /**

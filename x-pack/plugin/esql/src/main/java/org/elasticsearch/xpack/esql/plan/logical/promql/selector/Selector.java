@@ -16,20 +16,26 @@ import org.elasticsearch.xpack.esql.core.expression.Literal;
 import org.elasticsearch.xpack.esql.core.expression.TimeSeriesMetadataAttribute;
 import org.elasticsearch.xpack.esql.core.tree.Source;
 import org.elasticsearch.xpack.esql.parser.promql.PromqlLogicalPlanBuilder;
+import org.elasticsearch.xpack.esql.plan.logical.EsRelation;
+import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.UnaryPlan;
 import org.elasticsearch.xpack.esql.plan.logical.local.EmptyLocalSupplier;
 import org.elasticsearch.xpack.esql.plan.logical.local.LocalRelation;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PlaceholderRelation;
 import org.elasticsearch.xpack.esql.plan.logical.promql.PromqlPlan;
+import org.elasticsearch.xpack.esql.plan.logical.promql.TimeSeriesLabels;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult.Kind;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
+import java.util.TreeSet;
 
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.project;
 
@@ -131,6 +137,43 @@ public abstract sealed class Selector extends UnaryPlan implements PromqlPlan pe
                 EmptyLocalSupplier.EMPTY
             );
             return new IntermediateResult(empty, TranslationSchema.EMPTY, Literal.NULL, context.cmd().stepAttribute(), null, Kind.CONSTANT);
+        }
+
+        if (context.functionalMetadata()) {
+            var columns = new LinkedHashMap<String, Expression>();
+            var excludedFields = new TreeSet<String>();
+            for (String name : context.promotedNames()) {
+                Attribute field = TranslationContext.find(input.output(), name);
+                if (field instanceof FieldAttribute fa && fa.isDimension()) {
+                    columns.put(name, field);
+                    excludedFields.add(fa.fieldName().string());
+                }
+            }
+            // Runtime labels requested by BY still need GET even though the aggregate has finite output.
+            boolean needsMetadata = context.required().isOpen() || columns.keySet().containsAll(context.promotedNames()) == false;
+            var metadata = needsMetadata ? TimeSeriesMetadataAttribute.dictionary(source(), excludedFields) : null;
+            LogicalPlan plan = context.pushDownEvaluationTimestampFilter(input, this);
+            plan = plan.transformUp(EsRelation.class, relation -> {
+                var attrs = new ArrayList<>(relation.output());
+                attrs.removeIf(a -> a instanceof TimeSeriesMetadataAttribute);
+                if (metadata != null) {
+                    attrs.add(metadata);
+                }
+                return relation.withAttributes(attrs);
+            });
+            Expression filter = org.elasticsearch.xpack.esql.expression.predicate.Predicates.combineAndNullable(
+                java.util.Arrays.asList(matcher, context.emitBySrcTimeFilter(this))
+            );
+            if (filter != null) {
+                plan = new Filter(source(), plan, filter);
+            }
+            return new IntermediateResult(
+                plan,
+                new TimeSeriesLabels(columns, metadata),
+                value,
+                context.stepAttr(),
+                Kind.BEFORE_INITIAL_AGGREGATE
+            );
         }
 
         List<Attribute> dimensions = input.output()

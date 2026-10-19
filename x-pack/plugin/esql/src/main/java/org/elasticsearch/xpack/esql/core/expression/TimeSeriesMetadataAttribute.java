@@ -40,6 +40,28 @@ public final class TimeSeriesMetadataAttribute extends FieldAttribute {
         this.excludedFields = excludedFields;
     }
 
+    /** Typed dictionary source for the disabled functional metadata path; legacy readers remain keyword-typed. */
+    public static TimeSeriesMetadataAttribute dictionary(Source source, Set<String> excludedFields) {
+        EsField field = new EsField(
+            MetadataAttribute.TIMESERIES,
+            DataType.TIMESERIES,
+            java.util.Map.of(),
+            false,
+            EsField.TimeSeriesFieldType.DIMENSION
+        );
+        return new TimeSeriesMetadataAttribute(
+            source,
+            null,
+            null,
+            MetadataAttribute.TIMESERIES,
+            field,
+            Nullability.TRUE,
+            null,
+            false,
+            excludedFields
+        );
+    }
+
     public Set<String> excludedFields() {
         return excludedFields;
     }

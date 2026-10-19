@@ -29,9 +29,11 @@ import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.Project;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult;
 import org.elasticsearch.xpack.esql.plan.logical.promql.TranslationContext.IntermediateResult.Kind;
+import org.elasticsearch.xpack.esql.session.Configuration;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Function;
 
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.finite;
 import static org.elasticsearch.xpack.esql.plan.logical.promql.TranslationSchema.union;
@@ -132,10 +134,15 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
 
     @Override
     public List<Attribute> output() {
-        // The destination label is materialized during translation as a derived column exposed to the enclosing
-        // aggregation, so at the logical level the label set is that of the child; the derived label is surfaced only
-        // once translation runs.
-        return child().output();
+        List<Attribute> labels = child().output();
+        if (PromqlLabels.hasTsMetadata(labels)) {
+            return labels;
+        }
+        // A finite input remains finite. Its destination must survive even without an enclosing BY naming it.
+        var output = new ArrayList<>(labels);
+        output.removeIf(label -> PromqlLabels.labelName(label).equals(PromqlLabels.labelName(destination)));
+        output.add(destination);
+        return output;
     }
 
     @Override
@@ -166,6 +173,15 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
      */
     @Override
     public IntermediateResult translate(TranslationContext context) {
+        if (context.functionalMetadata()) {
+            IntermediateResult child = context.finish(context.withRequired(TranslationSchema.open()).translate(child()));
+            String destination = TranslationContext.mapFinite(destination());
+            Expression value = destinationValue(context.configuration(), child.labels()::get);
+            // A dictionary entry may span several promoted values. Keep functions reading them as columns.
+            boolean readsPromoted = sourceLabels().stream().anyMatch(child.labels().promoted()::containsKey);
+            TimeSeriesLabels labels = readsPromoted ? child.labels().promote(destination, value) : child.labels().set(destination, value);
+            return context.checkUnique(context.materialize(child, labels));
+        }
         // The child must expose the labels the derivation reads, on top of whatever the enclosing translation requires.
         TranslationSchema childRequired = union(context.required(), finite(sourceLabels()));
         IntermediateResult child = context.withRequired(childRequired).translate(child());
@@ -181,9 +197,7 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
 
         Source source = source();
         Attribute destination = destination();
-        Expression destinationValue = definition() == PromqlBuiltinFunctionDefinitions.LABEL_REPLACE
-            ? labelReplaceValue(context, source, aggregated)
-            : labelJoinValue(context, source, aggregated);
+        Expression destinationValue = destinationValue(context.configuration(), aggregated::label);
 
         String name = TranslationContext.mapFinite(destination);
         Alias derived = new Alias(source, destination.name(), destinationValue, destination.id());
@@ -208,6 +222,13 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
         );
     }
 
+    /** Share relabel value semantics; the translator chooses columns or dictionary GET expressions as inputs. */
+    Expression destinationValue(Configuration configuration, Function<String, Expression> labels) {
+        return definition() == PromqlBuiltinFunctionDefinitions.LABEL_REPLACE
+            ? labelReplaceValue(configuration, source(), labels)
+            : labelJoinValue(configuration, source(), labels);
+    }
+
     /**
      * The {@code label_replace} destination value:
      * {@code COALESCE(RegexExpand(COALESCE(src, ""), regex, repl), existingDst)}.
@@ -217,14 +238,14 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
      * destination overwrites one, or {@code ""} (the "absent" grouping key) when the destination is a new label. A match
      * with an empty expansion (the delete sentinel) resolves to {@code ""}, joining that same "absent" group.
      */
-    private Expression labelReplaceValue(TranslationContext context, Source source, IntermediateResult table) {
+    private Expression labelReplaceValue(Configuration configuration, Source source, Function<String, Expression> labels) {
         List<Expression> params = parameters();
         String srcLabel = literalString(params.get(2));
         Expression regex = params.get(3);
         Expression replacement = params.get(1);
-        Expression src = sourceLabelValue(context, source, table, srcLabel);
+        Expression src = sourceLabelValue(configuration, source, labels, srcLabel);
         Expression extracted = new RegexExpand(source, src, regex, replacement);
-        Expression existingDst = sourceLabelValue(context, source, table, TranslationContext.mapFinite(destination()));
+        Expression existingDst = sourceLabelValue(configuration, source, labels, TranslationContext.mapFinite(destination()));
         return new Coalesce(source, extracted, List.of(existingDst));
     }
 
@@ -235,7 +256,7 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
      * separator is inserted between every value, so even all-empty sources yield the separator run (for example a
      * {@code "-"} separator over two absent labels produces {@code "-"}), matching Prometheus.
      */
-    private Expression labelJoinValue(TranslationContext context, Source source, IntermediateResult table) {
+    private Expression labelJoinValue(Configuration configuration, Source source, Function<String, Expression> labels) {
         List<Expression> params = parameters();
         Literal separator = Literal.keyword(source, literalString(params.get(1)));
 
@@ -244,7 +265,7 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
             if (parts.isEmpty() == false) {
                 parts.add(separator);
             }
-            parts.add(sourceLabelValue(context, source, table, literalString(params.get(i))));
+            parts.add(sourceLabelValue(configuration, source, labels, literalString(params.get(i))));
         }
 
         return switch (parts.size()) {
@@ -259,12 +280,12 @@ public final class MetadataManipulationFunction extends PromqlFunctionCall {
      * table does not carry the label. The lookup reads the table's plan, so it sees stored labels only: a destination an
      * enclosing {@code by(dst)} requires is a name in the schema, never a column here, and cannot resolve to itself.
      */
-    private Expression sourceLabelValue(TranslationContext context, Source source, IntermediateResult table, String labelName) {
-        Attribute label = table.label(labelName);
+    private Expression sourceLabelValue(Configuration configuration, Source source, Function<String, Expression> labels, String labelName) {
+        Expression label = labels.apply(labelName);
         if (label == null) {
             return Literal.keyword(source, "");
         }
-        Expression stringValue = DataType.isString(label.dataType()) ? label : new ToString(source, label, context.configuration());
+        Expression stringValue = DataType.isString(label.dataType()) ? label : new ToString(source, label, configuration);
         return new Coalesce(source, stringValue, List.of(Literal.keyword(source, "")));
     }
 
